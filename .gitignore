@@ -4,3 +4,15 @@ __pycache__/
 out
 website/
 docs-minimind/
+
+# Claude Code 本地配置
+.agents/
+.vscode/
+skills-lock.json
+CLAUDE.md
+
+# 笔记中的临时文件
+notes/plot_activations.py
+notes/image.png
+notes/image-1.png
+notes/swiglu_activations.png
