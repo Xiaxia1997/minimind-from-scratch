@@ -8,9 +8,9 @@
 
 #### Attention 能做什么、不能做什么
 
-Attention 的输出 = $\text{softmax}(\frac{QK^T}{\sqrt{d}}) \cdot V$，本质上是 **V 向量的加权平均**。softmax 虽然是非线性的，但它只决定"从谁那里取多少权重"——最终每个 token 的输出是所有 V 的线性组合。
+Attention 的核心操作 = $\text{softmax}(\frac{QK^T}{\sqrt{d}}) \cdot V$。虽然 softmax 本身是非线性的，但 Attention 主要负责的是**跨 token 的信息混合**——决定从哪些 token 取多少信息，然后做加权组合。
 
-这意味着 Attention 能做的事情是**选择和混合**：从其他 token 那里收集信息。但它不能把收集来的信息**变换**成新的表征——线性组合只能产出原始 V 向量"中间"的值，不能产出 V 空间之外的新模式。
+Attention 有 Q/K/V 的线性投影和 softmax，不是纯线性系统，但它缺少**对每个 token 独立做的 position-wise 非线性特征变换**——这正是 FFN 的角色。
 
 #### FFN 是什么
 
@@ -18,7 +18,7 @@ FFN 就是**两层 MLP 中间夹一个激活函数**，对每个 token 独立做
 
 $$\text{FFN}(x) = W_2 \cdot \text{activation}(W_1 \cdot x)$$
 
-如果没有 FFN，多层 Attention 堆叠起来仍然只是在做 V 的线性组合的线性组合——表达能力严重受限。FFN 是每一层中**唯一引入非线性变换能力**的组件。
+FFN 对每个 token 独立地做非线性特征变换和通道混合，为模型增加大量 position-wise 的表达容量。没有 FFN，模型缺少对每个 token 的独立深度加工能力。
 
 #### 为什么要先升维再激活
 
@@ -61,11 +61,13 @@ $$\text{FFN}(x) = W_2 \cdot \text{ReLU}(W_1 \cdot x)$$
 
 先拆解 SiLU 的公式，它由两部分组成：
 
-$$\text{sigmoid}(x) = \frac{1}{1 + e^{-x}} \qquad \text{（输出范围 0~1，可以理解为"通过率"）}$$
+$$\text{sigmoid}(x) = \frac{1}{1 + e^{-x}} \qquad \text{（输出范围 (0,1)）}$$
 
-$$\text{SiLU}(x) = x \cdot \text{sigmoid}(x) \qquad \text{（信号 × 通过率 = 自门控）}$$
+$$\text{SiLU}(x) = x \cdot \text{sigmoid}(x) \qquad \text{（自门控）}$$
 
-SiLU 的含义：**x 自己决定自己能通过多少**。sigmoid(x) 把 x 映射到 0~1 之间作为"门控信号"，再乘回 x 本身——x 越大，sigmoid 越接近 1，几乎全部通过；x 越小（负值），sigmoid 越接近 0，大部分被抑制但不完全为零。
+注意：sigmoid 的输出在 (0,1) 之间，但 **SiLU 的输出不是 0~1**。因为 SiLU = x × sigmoid(x)，当 x 很大时 SiLU ≈ x（可以远大于 1），当 x 为负值时 SiLU 为负数（最小约 -0.28）。所以 SiLU 是一个**有符号的、可放大也可抑制的调制函数**，不能简单理解为"通过率"。
+
+直觉上：x 越大，sigmoid 越接近 1，SiLU ≈ x 几乎不衰减；x 为较大负值时，sigmoid 接近 0，SiLU 接近 0 但不完全为零。
 
 ![ReLU vs SiLU 对比与 SiLU 拆解](step2_silu.png)
 
@@ -101,19 +103,20 @@ $$\text{FFN}_{\text{SwiGLU}}(x) = \text{SwiGLU}(x) \cdot W_{\text{down}}$$
 两个同样大小的向量，对应位置一个一个乘：
 
 ```
-gate（门控信号）:  [0.92,  0.08,  0.85,  0.03]    ← SiLU(gate_proj) 产出
-up  （候选内容）:  [0.63,  0.97,  0.76,  0.50]    ← up_proj 产出
-                     ×      ×      ×      ×
-输出:              [0.58,  0.08,  0.65,  0.02]
-                    通过!   被压掉  通过!   被压掉
+gate（调制系数）:  [1.85,  -0.02,  1.42,  0.03]    ← SiLU(gate_proj) 产出
+up  （候选内容）:  [0.63,   0.97,  0.76,  0.50]    ← up_proj 产出
+                     ×       ×      ×      ×
+输出:              [1.17,  -0.02,  1.08,  0.02]
+                   放大!    反转    放大!   被压掉
 ```
 
-gate = 0.92 → 这个维度 92% 通过，内容几乎原样保留
-gate = 0.03 → 这个维度只剩 3%，基本被压掉了
+gate = 1.85 → 这个维度被放大（SiLU 对大正值可以 > 1）
+gate = 0.03 → 基本被压掉
+gate = -0.02 → 微弱反转（SiLU 对负值输出为负，但幅度很小）
 
 #### 三个投影各司其职
 
-- **gate_proj**（$W_{\text{gate}}$）：门控路径——投影后过 SiLU，产出每个维度的"通过程度"
+- **gate_proj**（$W_{\text{gate}}$）：门控路径——投影后过 SiLU，产出每个维度的调制系数（可放大、抑制或微弱反转）
 - **up_proj**（$W_{\text{up}}$）：内容路径——投影到高维，产出"候选特征"
 - **$\odot$**：门 × 内容 = 筛选后的特征（上图下半部分的绿色柱）
 - **down_proj**（$W_{\text{down}}$）：压回原维度
@@ -133,14 +136,17 @@ down_proj:      [2, 128, 768]   降回原维度
 ## intermediate_size 为什么是 2432
 
 SwiGLU 比原始 FFN 多了一个投影（3 个 vs 2 个），参数量多 50%。
-为了保持总参数量不变，intermediate_size 取 **8/3 × hidden_size** 而不是 4×。
+经典等参数推导会得到 **8/3 × hidden_size ≈ 2048** 作为 intermediate_size。
+
+MiniMind 源码实际用的是：
 
 ```python
 import math
 intermediate_size = math.ceil(768 * math.pi / 64) * 64
-# 768 × π ≈ 2413.7 → ceil(2413.7/64) = 38 → 38 × 64 = 2432
-# π ≈ 3.14 近似 8/3 ≈ 2.67，稍大一些
+# 768 × π ≈ 2412.7 → ceil(2412.7/64) = 38 → 38 × 64 = 2432
+# π ≈ 3.14 比 8/3 ≈ 2.67 大约 18%，所以 SwiGLU 比等参数的原始 FFN 多约 19% 参数
 # 对齐到 64 倍数是为了 GPU Tensor Core 对齐，矩阵乘法效率更高
+# 源码能证明公式，但不能确定作者选择 π 而非 8/3 的具体原因
 ```
 
 ## 参数量对比
@@ -168,22 +174,23 @@ SwiGLU 参数多 ~19%，但门控机制让效果显著更好。
 class FeedForward(nn.Module):
     def __init__(self, hidden_size=768, intermediate_size=2432):
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)  # Step 3: 门控
-        self.up_proj   = nn.Linear(hidden_size, intermediate_size, bias=False)  # Step 3: 候选特征
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)  # Step 3: 降维
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj   = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+```
 
-# 验证
-ffn = FeedForward()
-x = torch.randn(2, 128, 768)
-out = ffn(x)
-assert out.shape == x.shape  # [2, 128, 768]
+验证代码追加到 `if __name__ == '__main__':` 块中（参见 [01-Embedding](01-Embedding.md) 关于文件组织的说明）：
 
-total = sum(p.numel() for p in ffn.parameters())
-print(f"FFN params: {total:,}")  # 5,603,328
-print("FeedForward verified!")
+```python
+    # ---- FeedForward ----
+    ffn = FeedForward()
+    x = torch.randn(2, 128, 768)
+    assert ffn(x).shape == x.shape
+    total = sum(p.numel() for p in ffn.parameters())
+    print(f"FeedForward verified! params: {total:,}")  # 5,603,328
 ```
 
 ## 对照 MiniMind 源码
@@ -199,9 +206,9 @@ print("FeedForward verified!")
 
 | 特性 | MiniMind (64M) | Qwen2.5-7B | DeepSeek-V2 | LLaMA 3-8B |
 |------|---------------|------------|-------------|------------|
-| FFN 类型 | SwiGLU | SwiGLU | SwiGLU (MoE内) | SwiGLU |
-| intermediate_size | 2432 | 18944 | 12288 | 14336 |
-| 倍率 | 3.17× | 5.29× | 2.4× | 3.5× |
+| FFN 类型 | SwiGLU | SwiGLU | MoE（160 routed + 2 shared，top-6） | SwiGLU |
+| intermediate_size | 2432 | 18944 | Dense: 12288 / 专家: 1536 | 14336 |
+| 倍率 | 3.17× | 5.29× | Dense: 2.4× / 专家: 0.3× | 3.5× |
 | 激活函数 | SiLU | SiLU | SiLU | SiLU |
 | bias | 无 | 无 | 无 | 无 |
 
@@ -213,5 +220,5 @@ print("FeedForward verified!")
 > 三个投影：gate_proj 过 SiLU 决定'要不要通过'，up_proj 提供'通过什么内容'，
 > 两者逐元素相乘做门控，再由 down_proj 降回 768 维。
 > 相比原始 FFN 多一个投影但效果显著更好——门控让模型自己学会抑制不重要的特征。
-> 为了控制总参数量，中间维度取 8/3 倍而不是 4 倍。
-> 我用的是 ceil(768×π/64)×64=2432，对齐 64 方便 GPU Tensor Core。"
+> 经典等参数推导中间维度取 8/3 倍，MiniMind 实际用 ceil(768×π/64)×64=2432，
+> 比等参数略大约 19%，对齐 64 方便 GPU Tensor Core。"

@@ -3,66 +3,61 @@ from torch import nn
 import math
 import torch.nn.functional as F
 
+
+# ---- Chapter 02: RMSNorm ----
+
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-5):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-    
+
     def norm(self, x):
-        # x.pow(2).mean(-1, keepdim=True) → 沿 hidden_dim 求 x² 的均值
-        # torch.rsqrt → 1/sqrt，比 sqrt+除法更快（GPU 上一条指令）
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        # 先转 float32 算 norm（输入可能是 bf16/fp16，低精度算 rsqrt 数值不稳定）
-        # 算完 .type_as(x) 转回原精度
         return (self.weight * self.norm(x.float())).type_as(x)
 
+
+# ---- Chapter 03: RoPE ----
+
 def precompute_freqs_cis(dim, end=32768, rope_base=1e6):
-    # 1. 每个维度对的基础频率: 1/base^(2i/dim)
-    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[:(dim//2)].float() / dim))
-    # shape: [dim//2] = [48]，从高频到低频
-
-    # 2. 外积: 位置 × 频率 = 角度矩阵
-    t = torch.arange(end)              # [0, 1, ..., 32767]
-    freqs = torch.outer(t, freqs)      # [32768, 48]
-
-    # 3. cos/sin，cat 两份拼成 head_dim 长度（给 rotate_half 用）
-    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)  # [32768, 96]
-    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)  # [32768, 96]
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[:dim // 2].float() / dim))
+    t = torch.arange(end)
+    freqs = torch.outer(t, freqs)
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1)
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1)
     return freqs_cos, freqs_sin
+
 
 def apply_rotary_pos_emb(q, k, cos, sin):
     def rotate_half(x):
-        # [x1,...,x48, x49,...,x96] → [-x49,...,-x96, x1,...,x48]
-        # 等价于每对二维坐标的旋转矩阵乘法的展开形式
-        return torch.cat((-x[..., x.shape[-1]//2:], x[..., :x.shape[-1]//2]), dim=-1)
+        return torch.cat((-x[..., x.shape[-1] // 2:], x[..., :x.shape[-1] // 2]), dim=-1)
 
-    # cos/sin: [S, head_dim] → [S, 1, head_dim]，广播到所有 head
     cos = cos.unsqueeze(1)
     sin = sin.unsqueeze(1)
-    # 旋转公式: x' = x * cosθ + rotate_half(x) * sinθ
     q_embed = (q * cos + rotate_half(q) * sin).to(q.dtype)
     k_embed = (k * cos + rotate_half(k) * sin).to(k.dtype)
     return q_embed, k_embed
 
+
+# ---- Chapter 04: Attention (GQA + QK Norm + KV Cache + SDPA) ----
+
 def repeat_kv(x, n_rep):
     B, S, n_kv, d = x.shape
-    if n_rep == 1: return x  # MHA 直接返回
-    return x[:, :, :, None, :] \
-            .expand(B, S, n_kv, n_rep, d) \
-            .reshape(B, S, n_kv * n_rep, d)
-    # expand 是虚拟复制（共享内存，零开销）
-    # K₀ K₁ K₂ K₃ → K₀ K₀ K₁ K₁ K₂ K₂ K₃ K₃
+    if n_rep == 1:
+        return x
+    return x[:, :, :, None, :].expand(B, S, n_kv, n_rep, d).reshape(B, S, n_kv * n_rep, d)
+
 
 class Attention(nn.Module):
-    def __init__(self, hidden_size=768, n_heads=8, n_kv_heads=4, head_dim=96):
+    def __init__(self, hidden_size=768, n_heads=8, n_kv_heads=4, head_dim=96,
+                 dropout=0.0, flash_attn=True):
         super().__init__()
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
-        self.n_rep = n_heads // n_kv_heads
         self.head_dim = head_dim
+        self.n_rep = n_heads // n_kv_heads
 
         self.wq = nn.Linear(hidden_size, n_heads * head_dim, bias=False)
         self.wk = nn.Linear(hidden_size, n_kv_heads * head_dim, bias=False)
@@ -70,68 +65,66 @@ class Attention(nn.Module):
         self.wo = nn.Linear(n_heads * head_dim, hidden_size, bias=False)
         self.q_norm = RMSNorm(head_dim)
         self.k_norm = RMSNorm(head_dim)
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+        self.dropout = dropout
+        self.flash = hasattr(F, 'scaled_dot_product_attention') and flash_attn
 
-    def forward(self, x, cos, sin):
+    def forward(self, x, position_embeddings, past_key_value=None,
+                use_cache=False, attention_mask=None):
         B, S, _ = x.shape
-
         xq = self.wq(x).view(B, S, self.n_heads, self.head_dim)
         xk = self.wk(x).view(B, S, self.n_kv_heads, self.head_dim)
         xv = self.wv(x).view(B, S, self.n_kv_heads, self.head_dim)
 
         xq, xk = self.q_norm(xq), self.k_norm(xk)
+        cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
 
-        xk = repeat_kv(xk, self.n_rep)
-        xv = repeat_kv(xv, self.n_rep)
+        # KV Cache: 把历史 KV 和当前新 token 的 KV 沿 seq 维拼接
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
 
-        xq = xq.transpose(1, 2)  # [B, n_heads, S, head_dim]
-        xk = xk.transpose(1, 2)
-        xv = xv.transpose(1, 2)
+        xq = xq.transpose(1, 2)                         # [B, heads, S, dim]
+        xk = repeat_kv(xk, self.n_rep).transpose(1, 2)  # GQA repeat
+        xv = repeat_kv(xv, self.n_rep).transpose(1, 2)
 
-        scores = xq @ xk.transpose(-2, -1) / math.sqrt(self.head_dim)
-        mask = torch.full((S, S), float("-inf"), device=x.device).triu(1)
-        scores = scores + mask
-        output = F.softmax(scores.float(), dim=-1).type_as(xq) @ xv
+        if self.flash and S > 1 and past_key_value is None and \
+                (attention_mask is None or torch.all(attention_mask == 1)):
+            # SDPA 路径（训练时走这里）
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=True
+            )
+        else:
+            # 手写路径（带 KV Cache 的推理、有 padding mask 时走这里）
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores[:, :, :, -S:] += torch.full((S, S), float("-inf"), device=scores.device).triu(1)
+            if attention_mask is not None:
+                scores += (1.0 - attention_mask[:, None, None, :]) * -1e9
+            output = self.attn_dropout(F.softmax(scores.float(), dim=-1).type_as(xq)) @ xv
 
         output = output.transpose(1, 2).reshape(B, S, -1)
-        return self.wo(output)
-    
-class FeedForward(nn.Module):
-    def __init__(self, hidden_size=768, intermediate_size=2432):
-        super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)  # Step 3: 门控
-        self.up_proj   = nn.Linear(hidden_size, intermediate_size, bias=False)  # Step 3: 候选特征
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)  # Step 3: 降维
+        return self.resid_dropout(self.wo(output)), past_kv
 
-    def forward(self, x):
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
-    
-vocab_size = 6400    # 词表大小：能认多少个"字"
-hidden_size = 768    # 每个字映射成多长的向量
 
-embed_tokens = nn.Embedding(vocab_size, hidden_size)
-# 本质：一个 [6400, 768] 的可学习矩阵
-# 每一行是一个 token 的向量表示，初始随机，训练中更新
-input_ids = torch.tensor([[1, 42, 7, 100]])  # [batch=1, seq_len=4]
-hidden_states = embed_tokens(input_ids)       # [1, 4, 768]
-dropout = nn.Dropout(0.0)  # MiniMind 默认 0.0，但架构里留了这个口子
-hidden_states = dropout(embed_tokens(input_ids))
-# [batch, seq_len, 768]
-
-lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
-# 权重矩阵: [768, 6400]（Linear 内部转置存储）
-embed_tokens.weight = lm_head.weight  # 共享权重，省 ~490 万参数
+# ---- Chapter 05: FeedForward (SwiGLU) ----
 
 class FeedForward(nn.Module):
     def __init__(self, hidden_size=768, intermediate_size=2432):
         super().__init__()
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj   = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
 
     def forward(self, x):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
+
+# ---- Chapter 06: MOEFeedForward ----
 
 class MOEFeedForward(nn.Module):
     def __init__(self, hidden_size=768, intermediate_size=2432,
@@ -167,7 +160,8 @@ class MOEFeedForward(nn.Module):
             if mask.any():
                 token_idx = mask.any(dim=-1).nonzero().flatten()
                 weight = topk_weight[mask].view(-1, 1)
-                y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
+                y.index_add_(0, token_idx,
+                             (expert(x_flat[token_idx]) * weight).to(y.dtype))
             elif self.training:
                 y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
 
@@ -178,3 +172,105 @@ class MOEFeedForward(nn.Module):
             self.aux_loss = scores.new_zeros(1).squeeze()
 
         return y.view(B, S, D)
+
+
+# ---- Chapter 07: MiniMindBlock ----
+
+class MiniMindBlock(nn.Module):
+    def __init__(self, hidden_size=768, n_heads=8, n_kv_heads=4,
+                 head_dim=96, intermediate_size=2432, use_moe=False,
+                 dropout=0.0, flash_attn=True):
+        super().__init__()
+        self.self_attn = Attention(hidden_size, n_heads, n_kv_heads, head_dim,
+                                   dropout, flash_attn)
+        self.input_layernorm = RMSNorm(hidden_size, eps=1e-6)
+        self.post_attention_layernorm = RMSNorm(hidden_size, eps=1e-6)
+        self.mlp = MOEFeedForward(hidden_size, intermediate_size) if use_moe else FeedForward(hidden_size, intermediate_size)
+
+    def forward(self, hidden_states, position_embeddings,
+                past_key_value=None, use_cache=False, attention_mask=None):
+        # Pre-Norm + Attention + 残差
+        residual = hidden_states
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings, past_key_value, use_cache, attention_mask,
+        )
+        hidden_states = hidden_states + residual
+
+        # Pre-Norm + FFN + 残差
+        residual = hidden_states
+        hidden_states = self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
+        hidden_states = hidden_states + residual
+
+        return hidden_states, present_key_value
+
+
+# ---- 验证 ----
+
+if __name__ == '__main__':
+    # ---- Embedding + LM Head ----
+    vocab_size = 6400
+    hidden_size = 768
+    embed_tokens = nn.Embedding(vocab_size, hidden_size)
+    input_ids = torch.randint(0, vocab_size, (2, 128))
+    hidden_states = embed_tokens(input_ids)
+    dropout = nn.Dropout(0.0)
+    hidden_states = dropout(hidden_states)
+    lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+    embed_tokens.weight = lm_head.weight
+    assert hidden_states.shape == (2, 128, 768)
+    print("Embedding + LM Head verified!")
+
+    # ---- RMSNorm ----
+    norm = RMSNorm(768)
+    assert norm(hidden_states).shape == hidden_states.shape
+    print("RMSNorm verified!")
+
+    # ---- RoPE ----
+    freqs_cos, freqs_sin = precompute_freqs_cis(dim=96, end=512)
+    assert freqs_cos.shape == (512, 96)
+    print("RoPE verified!")
+
+    # ---- Attention (含 KV Cache) ----
+    attn = Attention()
+    cos, sin = freqs_cos[:128], freqs_sin[:128]
+    out, kv = attn(hidden_states, (cos, sin), use_cache=True)
+    assert out.shape == hidden_states.shape
+    assert kv[0].shape == (2, 128, 4, 96)  # KV Cache: [B, S, n_kv_heads, head_dim]
+    # KV Cache 推理：只传 1 个新 token，复用历史 cache
+    new_token = torch.randn(2, 1, 768)
+    cos2, sin2 = freqs_cos[128:129], freqs_sin[128:129]
+    out2, kv2 = attn(new_token, (cos2, sin2), past_key_value=kv, use_cache=True)
+    assert out2.shape == (2, 1, 768)
+    assert kv2[0].shape == (2, 129, 4, 96)  # cache 增长了 1
+    print("Attention (GQA + QK Norm + KV Cache + SDPA) verified!")
+
+    # ---- FeedForward ----
+    ffn = FeedForward()
+    x = torch.randn(2, 128, 768)
+    assert ffn(x).shape == x.shape
+    print("FeedForward verified!")
+
+    # ---- MOEFeedForward ----
+    moe = MOEFeedForward()
+    x = torch.randn(2, 128, 768)
+    assert moe(x).shape == x.shape
+    total = sum(p.numel() for p in moe.parameters())
+    expert_params = sum(p.numel() for p in moe.experts.parameters())
+    router_params = sum(p.numel() for p in moe.gate.parameters())
+    print(f"MoE total params: {total:,}")
+    print(f"  Expert params:  {expert_params:,}")
+    print(f"  Router params:  {router_params:,}")
+    print("MOEFeedForward verified!")
+
+    # ---- MiniMindBlock ----
+    block = MiniMindBlock()
+    x = torch.randn(2, 128, 768)
+    cos, sin = freqs_cos[:128], freqs_sin[:128]
+    out, kv = block(x, (cos, sin), use_cache=True)
+    assert out.shape == x.shape
+    assert kv[0].shape == (2, 128, 4, 96)
+    print(f"Block params: {sum(p.numel() for p in block.parameters()):,}")
+    print("MiniMindBlock verified!")

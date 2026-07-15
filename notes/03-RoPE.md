@@ -30,7 +30,7 @@ Attention 本身是**位置无关**的——"我 爱 你" 和 "你 爱 我" 的 
 
 原始 Transformer 的做法：给每个位置一个固定向量，直接**加到 Embedding 上**。伪代码示意：
 
-```ß
+```python
 for pos in range(max_len):
     for i in range(0, hidden_size, 2):
         PE[pos, 2i]   = sin(pos / base^(2i/d))    # base=10000
@@ -56,7 +56,7 @@ RMSNorm → Attention → + 残差 → RMSNorm → FFN → + 残差
 
 **三个问题**：
 - 注意力分数 `(x_m + PE(m))^T · W · (x_n + PE(n))` 同时依赖 m 和 n 的**绝对值**，无法只表达相对距离
-- 位置 5000 的 PE 在训练中如果没见过（训练只用了 2048 长度），推理时直接崩——外推性差
+- 超出训练长度时属于分布外推，效果可能下降（固定 sinusoidal PE 仍能计算未见位置，但 Learned PE 会索引越界）
 - PE 加上去之后经过 RMSNorm、FFN 等非线性变换，位置信息会被**扭曲和稀释**
 
 ### Step 2：我们想要什么——数学目标
@@ -94,7 +94,7 @@ RoPE 的解法是：**不在 Embedding 层加位置信息，而是在 Attention 
 
 接下来的问题是：这个 Rot 旋转具体怎么设计，才能让 Q·K 点积只含 m-n？
 
-### Step 3：二维旋转是唯一解
+### Step 3：二维旋转是最小构造
 
 RoPE 论文从最简单的情况开始——**先只看 2 维的 q 和 k**。
 
@@ -115,8 +115,8 @@ $$f(\mathbf{x}, m) = \text{Rot}(m\theta) \cdot \mathbf{x} = \begin{bmatrix} \cos
 **为什么是二维旋转，不是一维或三维？**
 - **一维**：没有旋转。只能缩放（乘以标量），会改变向量大小，破坏语义信息
 - **二维**：一个角度唯一确定一个旋转。位置 m → 角度 mθ，映射天然且唯一
-- **三维**：旋转需要指定旋转轴 + 旋转角 = 至少 2 个参数，但位置 m 只是一个标量，不够用
-- 数学上，**二维旋转是满足"点积只含相对位置"这个约束的最小单元**
+- **三维**：旋转需要指定旋转轴 + 旋转角，但预先固定旋转轴后也可行，只是不如二维简洁
+- 数学上，**二维旋转是最小的非平凡实数正交旋转块**，便于扩展成分块对角矩阵
 
 ### Step 4：从 2 维推广到 96 维——三个关键问题
 
@@ -140,18 +140,11 @@ head_dim = hidden_size / n_heads = 768 / 8 = 96
 
 2 维的解有了，96 维怎么办？
 
-#### Q1：为什么所有 96 维都要参与旋转，不能只用 2 维？
+#### Q1：为什么 MiniMind 对所有 96 维做旋转？
 
-假设只旋转 (q0, q1) 这一对，q2~q95 不动：
+MiniMind 把全部 head_dim 都参与旋转，让位置信息均匀分布在整个向量上。
 
-$$Q_m \cdot K_n = \underbrace{(q_0' k_0' + q_1' k_1')}_{\text{2 维，带位置信息}} + \underbrace{(q_2 k_2 + q_3 k_3 + \cdots + q_{95} k_{95})}_{\text{94 维，纯语义，无位置信息}}$$
-
-- 位置信号占比：$2/96 \approx 2\%$
-- 语义信号占比：$94/96 \approx 98\%$
-
-位置信号被 94 维的语义信号淹没，模型几乎看不到位置差异。
-
-**所有 96 维都参与旋转**：位置信息均匀分布在整个向量上，和语义信息充分混合。
+只旋转部分维度（Partial RoPE）也是可行的设计——比如 DeepSeek MLA 就只对 Q/K 的一部分维度应用 RoPE，另一部分保持纯语义。不同设计在位置容量和语义容量之间做不同的分配取舍。
 
 做法：**把 96 维拆成 48 个独立的二维平面，每个平面各自做二维旋转**：
 
@@ -193,17 +186,17 @@ R(m) · q = │              Rot(θ₂)       │ · │ q2  │
 
 高频转得快，近距离精度高（位置 0 和 1 差 57°，很清晰），但周期短——**每 6 个 token 就转一圈**，位置 0 和位置 6 无法区分，远距离全乱了。
 
-**错误方案 B：全用低频率（ω₄₇ ≈ 0.00013）**
+**错误方案 B：全用低频率（ω₄₇ ≈ 1.3×10⁻⁶）**
 
-48 对都用 $\omega = 0.00013$：
+48 对都用 $\omega = 1.3 \times 10^{-6}$：
 
 近距离：
-- 位置 0 vs 位置 1：角度差 $= 0.00013 \text{ rad} \approx 0.0075°$
-- $\cos(0.0075°) = 0.999999991$，相邻 token 的旋转向量几乎完全重合，点积 $\approx 1.0$
+- 位置 0 vs 位置 1：角度差 $= 1.3 \times 10^{-6} \text{ rad} \approx 0.000075°$
+- $\cos(0.000075°) \approx 1.0$，相邻 token 的旋转向量几乎完全重合
 - 模型分不清 "我爱你" 和 "我你爱" -- 近距离完全糊掉
 
 远距离：
-- 位置 0 vs 位置 10000：角度差 $= 1.3 \text{ rad} \approx 75°$ -- 能区分
+- 位置 0 vs 位置 10000：角度差 $= 0.013 \text{ rad} \approx 0.76°$ -- 仍然很小，区分度有限
 
 低频转得慢，远距离不碰撞，但近距离角度差太小，模型看不出区别。
 
@@ -272,19 +265,21 @@ $$T_{\min} = 2\pi \cdot \text{base}^{0} = 2\pi \qquad\qquad T_{\max} = 2\pi \cdo
 MiniMind 中 dim=96，指数为 $94/96 \approx 0.979$，$T_{\max} \approx 4.7 \times 10^6$，略小于天花板 $2\pi \cdot \text{base} \approx 6.3 \times 10^6$。dim 越大这个差距越小，但影响不大——**真正决定周期上界的是 base**：
 
 ```
-原始 Transformer: base = 10,000    → T_max ≈ 6.3 万    → 覆盖 ~512 token
-LLaMA-3:         base = 500,000   → T_max ≈ 314 万    → 覆盖 ~8k token
-MiniMind:        base = 1,000,000 → T_max ≈ 470 万    → 设计目标覆盖 32k token
+原始 Transformer: base = 10,000    → T_max ≈ 6.3 万
+LLaMA-3:         base = 500,000   → T_max ≈ 314 万
+MiniMind:        base = 1,000,000 → T_max ≈ 470 万
 ```
+
+注意：base 决定的是最低频维度的周期上界，但**模型实际支持的上下文长度不是由 base 单独决定的**——还取决于训练长度、RoPE scaling 策略、Attention 实现和评测方式。不能把 T_max 直接等同于"支持 XX token"。
 
 注意：base 决定的是 RoPE 的位置编码范围，但模型的实际上下文长度还受多个因素限制：
 
 | 瓶颈 | 原因 | 相关章节 |
 |------|------|---------|
 | KV Cache 显存 | 每个 token 都要存 K 和 V，1M token 显存吃不消 | [04-Attention](04-Attention.md) 讲 GQA 如何省 KV，DeepSeek MLA 进一步压缩 |
-| Attention O(n²) 计算量 | 标准 Attention 是 n² 复杂度 | [14-FlashAttention](14-FlashAttention.md) 讲如何加速，但不改复杂度 |
+| Attention O(n²) 计算量 | 标准 Attention 是 n² 复杂度 | [17-FlashAttention](17-FlashAttention.md) 讲如何加速，但不改复杂度 |
 | 训练分布 | 训练时只见过 4k 长度，推理给 32k 就是 OOD | 本章 YaRN 章节讲推理时频率缩放 |
-| 稀疏/线性 Attention | 滑动窗口、分块稀疏、Mamba SSM 等 | 待补充（18-长上下文技术） |
+| 稀疏/线性 Attention | 滑动窗口、分块稀疏、Mamba SSM 等 | [20-长上下文技术](20-长上下文技术.md) |
 
 支持 1M 上下文的模型（Claude、Gemini）需要综合以上所有技术，不只是 RoPE base 调大。
 
@@ -323,8 +318,8 @@ $$= \mathbf{q}_i^T \cdot \text{Rot}((n-m) \cdot \omega_i) \cdot \mathbf{k}_i$$
     例: pos3 的 Q 和 pos7 的 K  → 角度差 = 4 × ωi
         pos100 的 Q 和 pos104 的 K → 角度差 = 4 × ωi  ← 一样！
 
-    "位置3看位置7" 和 "位置100看位置104" 的注意力分数相同
-    因为相对距离都是 4
+    "位置3看位置7" 和 "位置100看位置104" 的 RoPE 旋转因子相同
+    因为相对距离都是 4（但实际注意力分数还取决于 token 内容，通常不完全相同）
 ```
 
 #### 6.3 所有平面加起来
@@ -377,6 +372,40 @@ Step 5 的频率公式                    Step 4 Q3 的角度
 
 这个表只算一次，注册为 buffer（不参与梯度更新），每次 forward 按位置切片取用。
 
+#### 为什么 cos/sin 要拼两份（48 → 96）？
+
+角度只有 48 个（48 对维度，每对一个角度），但 `q * cos` 是**逐元素乘**——q 有 96 维，cos 也必须有 96 维，否则长度不匹配。
+
+用 dim=4（2 对）的例子展开整个计算过程：
+
+q 的维度配对方式：**前后半截配对**，不是相邻配对。
+- 对 0：(q[0], q[2])，用角度 θ₀
+- 对 1：(q[1], q[3])，用角度 θ₁
+
+```
+q             = [q0,   q1,   q2,   q3]
+
+rotate_half(q):
+  后半取负:   [-q2, -q3]
+  前半不变:   [q0,   q1]
+  拼起来:     [-q2, -q3,  q0,  q1]
+
+cos (拼两份): [cosθ₀, cosθ₁, cosθ₀, cosθ₁]
+sin (拼两份): [sinθ₀, sinθ₁, sinθ₀, sinθ₁]
+                前半=对0,对1     后半=同样的值再来一遍
+```
+
+套进公式 `q * cos + rotate_half(q) * sin`，逐位置展开：
+
+```
+位置 0:  q0·cosθ₀ + (-q2)·sinθ₀  =  q0·cosθ₀ - q2·sinθ₀   ← 对0的第一个分量 ✓
+位置 1:  q1·cosθ₁ + (-q3)·sinθ₁  =  q1·cosθ₁ - q3·sinθ₁   ← 对1的第一个分量 ✓
+位置 2:  q2·cosθ₀ +   q0·sinθ₀   =  q2·cosθ₀ + q0·sinθ₀   ← 对0的第二个分量 ✓
+位置 3:  q3·cosθ₁ +   q1·sinθ₁   =  q3·cosθ₁ + q1·sinθ₁   ← 对1的第二个分量 ✓
+```
+
+位置 2 用了 `cos[2] = cosθ₀`，位置 3 用了 `cos[3] = cosθ₁`——和位置 0、1 是**同一组角度**。如果 cos 只有 `[cosθ₀, cosθ₁]` 两个值，位置 2、3 就没有对应的值可乘了。所以必须拼两份，让前半和后半都能拿到相同的角度。
+
 ### Step 8：写旋转函数
 
 有了预计算的 cos/sin 表，旋转函数要做的就是 Step 3 推导的旋转矩阵乘法。
@@ -398,6 +427,10 @@ def apply_rotary_pos_emb(q, k, cos, sin):
         # 对 48 个二维平面同时做 90° 旋转
         # [q0,...,q47, q48,...,q95] → [-q48,...,-q95, q0,...,q47]
         #  前半截          后半截       后半截取反      前半截
+        #
+        # x[...] 中的 ... 是省略号索引（Ellipsis），表示"前面所有维度保持不变"
+        # x 形状 [B, S, n_heads, head_dim]，x[..., :48] 等价于 x[:, :, :, :48]
+        # 好处是不用数前面有几个维度，写法更通用
         return torch.cat((-x[..., x.shape[-1]//2:], x[..., :x.shape[-1]//2]), dim=-1)
 
     # cos/sin: [S, head_dim] → [S, 1, head_dim]，广播到所有 head
@@ -436,18 +469,196 @@ print("RoPE applied, shapes preserved")
 
 ## YaRN 外推（推理时启用）
 
-当序列超过训练长度时，低频分量可能超出训练分布。YaRN 的思想：**分频段处理**。
+### 问题：推理长度 > 训练长度时发生了什么？
 
-```python
-# 高频维度（近距离）→ 不缩放，保持精度
-# 低频维度（远距离）→ 缩放 1/factor，扩展范围
-# 中间维度 → 线性插值过渡
+MiniMind 训练时 `original_max_position_embeddings = 2048`，推理时想支持 `end = 32768`（16 倍）。
 
-ramp = clamp((i - low) / (high - low), 0, 1)   # γ ∈ [0,1]
-freqs = freqs * (1 - ramp + ramp / factor)       # 高频不动，低频除以 factor
+不同频率的维度，面临的风险完全不同：
+
+**高频维度（pair 0，$\omega_0 = 1.0$，周期 $\approx 6.28$）**：
+- 训练时最大角度 $= 2047 \times 1.0 = 2047$ rad $\approx 325$ 圈
+- 推理时最大角度 $= 32767 \times 1.0 = 32767$ rad $\approx 5214$ 圈
+- cos/sin 是周期函数，转了 325 圈意味着所有相位角都见过了
+- 多转几圈不会产生新的 cos/sin 值 → **没有 OOD 问题**
+
+**低频维度（pair 47，$\omega_{47} = 1.3 \times 10^{-6}$，周期 $\approx 470$ 万）**：
+- 训练时最大角度 $= 2047 \times 1.3 \times 10^{-6} = 0.00266$ rad
+- 推理时最大角度 $= 32767 \times 1.3 \times 10^{-6} = 0.0426$ rad
+- 0.0426 是训练时见过的 0.00266 的 **16 倍**
+- 模型在这些角度上没有被训练过 → **分布外推（OOD）→ 效果崩坏**
+
+核心洞察：**高频维度安全，低频维度危险，需要分别处理。**
+
+### 方案演进：从暴力到精细
+
+#### 方案 1: Position Interpolation（PI）— Meta, 2023.06
+
+最暴力的方法：把所有位置**等比压缩**回训练范围。
+
+```
+原来:  位置 0, 1, 2, ..., 32767  →  角度 theta(m) = m * omega
+压缩:  位置 0, 0.0625, 0.125, ..., 2047  →  theta(m) = m * omega / factor
+做法:  freqs 全部除以 factor=16
+
+效果:  所有角度都落在训练范围内，不会 OOD
+问题:  高频维度被压缩 16 倍，相邻 token 的角度差从 1.0 变成 0.0625
+       近距离分辨率大幅下降 → 短距离理解能力变差
 ```
 
-面试一般不会深问 YaRN 细节，知道"分频段处理"就够。
+#### 方案 2: NTK-aware — Reddit 用户 bloc97, 2023.06
+
+不压缩位置，而是**调大 base**：
+
+$$\text{new\_base} = \text{base} \times \text{factor}^{\text{dim}/(\text{dim}-2)}$$
+
+效果：所有频率都降低，但降低幅度不均匀——低频降得多、高频降得少。比 PI 更好地保留了高频精度，但高频维度不需要降也被降了。
+
+#### 方案 3: NTK-by-parts — YaRN 论文 Section 3.4, 2023.09
+
+> 这是 YaRN 论文（Peng et al., Nous Research / EleutherAI）Section 3.4 的内容，**不是 Qwen 提出的**。
+
+核心思想：既然不同频率维度风险不同，就**分段处理**。
+
+把 48 个维度对分成三段：
+
+```
+┌──────────────┬────────────────────┬────────────────┐
+│   高频段       │     过渡段          │    低频段       │
+│   i < low     │  low <= i <= high  │   i > high     │
+│   γ = 0       │  0 < γ < 1         │   γ = 1        │
+│   不缩放       │  线性插值           │  全力缩放/factor│
+│   保持近距离精度│  平滑过渡           │  扩展远距离范围  │
+└──────────────┴────────────────────┴────────────────┘
+```
+
+缩放公式：
+
+$$f'(\omega_i) = \omega_i \times (1 - \gamma + \gamma / \text{factor})$$
+
+- $\gamma = 0$：$\omega_i \times 1 = \omega_i$（完全不动）
+- $\gamma = 1$：$\omega_i \times (1/\text{factor}) = \omega_i / 16$（等价于 PI 的全力压缩）
+- $\gamma = 0.5$：$\omega_i \times 0.53125$（折中）
+
+#### 方案 4: YaRN = NTK-by-parts + Attention Scaling（Section 3.5）
+
+YaRN 在 NTK-by-parts 基础上加了 `attention_factor`，乘到 cos/sin 上补偿注意力熵的变化。MiniMind 中 `attention_factor = 1.0`，所以实际等价于纯 NTK-by-parts。
+
+### 分界线怎么算？—— inv_dim 反函数
+
+最关键的问题：**low 和 high 怎么确定？**
+
+思路：找到"哪些维度的周期短到在训练长度内能转足够多圈"。
+
+维度对 $i$ 的周期 $T_i = 2\pi / \omega_i = 2\pi \times \text{base}^{2i/\text{dim}}$。论文引入 $\beta$ 参数量化"多短算短"：
+
+$$\text{波长阈值} = \text{orig\_max} / \beta$$
+
+- $\beta_{\text{fast}} = 32$：波长阈值 $= 2048/32 = 64$。周期 $< 64$ 的维度算"高频"（训练时至少转了 32 圈，精度绰绰有余）
+- $\beta_{\text{slow}} = 1$：波长阈值 $= 2048/1 = 2048$。周期 $> 2048$ 的维度算"低频"（训练时连一圈都转不完，必须缩放）
+
+**inv_dim 做的是反函数**——给定波长阈值，反算对应的维度编号：
+
+$$T_i = \text{orig\_max} / \beta = 2\pi \times \text{base}^{2i/\text{dim}}$$
+
+$$i = \frac{\text{dim} \times \ln(\text{orig\_max} / (\beta \times 2\pi))}{2 \times \ln(\text{base})}$$
+
+代入 MiniMind 的具体数字（dim=96, base=1e6, orig_max=2048）：
+
+$$\text{low} = \lfloor \text{inv\_dim}(\beta_{\text{fast}}=32) \rfloor = \lfloor \frac{96 \times \ln(2048 / 201.06)}{2 \times \ln(10^6)} \rfloor = \lfloor \frac{96 \times 2.321}{27.631} \rfloor = \lfloor 8.07 \rfloor = 8$$
+
+$$\text{high} = \lceil \text{inv\_dim}(\beta_{\text{slow}}=1) \rceil = \lceil \frac{96 \times \ln(2048 / 6.283)}{2 \times \ln(10^6)} \rceil = \lceil \frac{96 \times 5.787}{27.631} \rceil = \lceil 20.11 \rceil = 21$$
+
+MiniMind 的 48 个维度对被分成：
+
+| 段 | 维度对 | $\gamma$ | 行为 | 物理含义 |
+|:--:|:------:|:--------:|:----:|:---------|
+| 高频 | pair 0-7 | 0 | 不缩放 | 周期 6~68，训练时转了 30~341 圈 |
+| 过渡 | pair 8-21 | 0~1 线性 | 部分缩放 | 周期 68~3700，部分见过 |
+| 低频 | pair 22-47 | 1 | 除以 16 | 周期 3700~470万，训练时没转完一圈 |
+
+### 源码逐行解读
+
+```python
+def precompute_freqs_cis(dim, end=32768, rope_base=1e6, rope_scaling=None):
+    # Step 1: 标准 RoPE 频率
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[:(dim//2)].float() / dim))
+    # freqs: [48], 从 1.0(高频) 到 1.3e-6(低频)
+
+    attn_factor = 1.0
+
+    if rope_scaling is not None:
+        orig_max = 2048    # 训练长度
+        factor = 16        # 外推倍数: 2048 × 16 = 32768
+        beta_fast = 32.0   # 高频边界（转 32 圈以上算高频）
+        beta_slow = 1.0    # 低频边界（转不到 1 圈算低频）
+        attn_factor = 1.0  # 注意力缩放因子
+
+        # 只在推理长度超过训练长度时才缩放
+        if end / orig_max > 1.0:
+            # Step 2: 反函数——波长阈值 → 维度编号
+            inv_dim = lambda b: (
+                dim * math.log(orig_max / (b * 2 * math.pi))
+            ) / (2 * math.log(rope_base))
+
+            low = max(math.floor(inv_dim(beta_fast)), 0)             # = 8
+            high = min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)  # = 21
+
+            # Step 3: 线性斜坡 γ
+            # pair 0-7 → 0, pair 8-21 → 0~1 线性, pair 22-47 → 1
+            ramp = torch.clamp(
+                (torch.arange(dim // 2).float() - low) / max(high - low, 0.001),
+                0, 1
+            )
+
+            # Step 4: 分段缩放
+            # γ=0: freqs × 1.0     （原频率，高频不动）
+            # γ=1: freqs × 1/16    （频率除以 factor，低频全力压缩）
+            freqs = freqs * (1 - ramp + ramp / factor)
+
+    # 后续和标准 RoPE 一样
+    t = torch.arange(end)
+    freqs = torch.outer(t, freqs).float()
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+    return freqs_cos, freqs_sin
+```
+
+### Qwen 的长上下文方案
+
+> **注意**：NTK-by-parts（YaRN Section 3.4）不是 Qwen 提出的，而是 Nous Research / EleutherAI 的工作。Qwen 有自己独立的长上下文方案，后来转向了 YaRN。
+
+**Qwen-1（2023.08）** 提出了三板斧组合：
+
+| 技术 | 做法 | 解决什么 |
+|------|------|---------|
+| Dynamic NTK | 推理时根据当前序列长度动态调大 base | 低频维度的 OOD |
+| LogN Scaling | 注意力分数除以 $\sqrt{\log(n) / \log(\text{train\_len})}$ | 序列变长后注意力熵增大 |
+| Window Attention | 底层用滑动窗口注意力 | 减少长序列计算量 |
+
+Dynamic NTK 和 YaRN 的区别：
+
+```
+Dynamic NTK（Qwen-1）:
+  if seq_len > training_length:
+      ratio = seq_len / training_length
+      new_base = base * ratio ^ (dim / (dim - 2))
+  整体调大 base，不区分频段
+
+YaRN NTK-by-parts:
+  按 gamma 分三段：高频不动，低频缩放，中间过渡
+  更精细，效果更好
+```
+
+**Qwen 方案演进**：
+
+| 版本 | 时间 | base | 外推方案 | 支持长度 |
+|------|------|------|---------|---------|
+| Qwen-1 | 2023.08 | 10,000 | Dynamic NTK + LogN | 8K → 32K |
+| Qwen-1.5 | 2024.02 | 1,000,000 | 大 base（类 NTK-aware） | 32K |
+| Qwen-2 | 2024.06 | 1,000,000 | YaRN | 128K |
+| Qwen-2.5 | 2024.09 | 1,000,000 | YaRN | 128K / 1M |
+
+关键转折：从 Qwen-1.5 开始，Qwen 抛弃了自己的 Dynamic NTK，转向大 base + YaRN——社区验证后 YaRN 效果更好。
 
 ## 在完整模型中的位置
 
@@ -480,17 +691,17 @@ MiniMind 额外支持 YaRN 外推（`inference_rope_scaling=True` 时），我�
 
 | 方式 | 加在哪 | 绝对/相对 | 外推性 |
 |------|--------|----------|--------|
-| Sinusoidal（原始 Transformer） | Embedding 后直接加 | 绝对 | 差 |
-| Learned Position Embedding（GPT-2） | Embedding 后直接加 | 绝对 | 差 |
-| ALiBi（BLOOM） | Attention score 上加偏置 | 相对 | 好 |
-| **RoPE（LLaMA/Qwen/DeepSeek/MiniMind）** | **Attention 内旋转 Q/K** | **相对** | **好** |
+| Sinusoidal（原始 Transformer） | Embedding 后直接加 | 绝对 | 有限（可计算未见位置，但属分布外推） |
+| Learned Position Embedding（GPT-2） | Embedding 后直接加 | 绝对 | 差（超表长索引越界） |
+| ALiBi（BLOOM） | Attention score 上加偏置 | 相对 | 具有相对位置归纳偏置 |
+| **RoPE（LLaMA/Qwen/DeepSeek/MiniMind）** | **Attention 内旋转 Q/K** | **相对** | **具有相对位置归纳偏置，vanilla RoPE 长度外推仍有限** |
 
 | 模型 | 位置编码 | 特点 |
 |------|---------|------|
-| MiniMind | RoPE（θ=1e6） | 48 对子空间，支持 YaRN 外推到 32k |
-| Qwen2.5 | RoPE（θ=1e6） | YaRN 外推到 128k，加 dynamic NTK scaling |
+| MiniMind | RoPE（θ=1e6） | 48 对子空间，config 支持 YaRN |
+| Qwen2.5 | RoPE（θ=1e6） | 128K/1M 上下文，Qwen-1 用 Dynamic NTK+LogN，Qwen-1.5+ 转向大 base+YaRN |
 | DeepSeek-V3 | RoPE（θ=1e4） | MLA 架构下的 decoupled RoPE（只对 Q/K 部分维度加 RoPE） |
-| LLaMA-3 | RoPE（θ=5e5） | 大 base frequency + NTK-aware scaling |
+| LLaMA-3 | RoPE（θ=5e5） | 原始版本 8K 上下文；LLaMA 3.1 引入新的长上下文 scaling |
 
 DeepSeek MLA 的 decoupled 设计：K 分两部分，只对其中一部分加 RoPE，另一部分不加。
 因为 KV Cache 压缩需要去掉位置信息，而 RoPE "必须加在 Q/K 上"这个约束与压缩冲突，
@@ -498,8 +709,12 @@ DeepSeek MLA 的 decoupled 设计：K 分两部分，只对其中一部分加 Ro
 
 ## 面试话术
 
+> **RoPE 核心**：
 > "RoPE 的核心是在 Attention 内部对 Q 和 K 做旋转编码位置。head_dim 拆成多对二维坐标，每对用不同频率旋转——高频管近距离精度，低频管远距离范围，组合起来像组合锁一样让每个位置有唯一指纹。
 > 频率公式和原始 sinusoidal PE 完全一样，RoPE 的改进在操作上——旋转代替加法。旋转矩阵的正交性保证了 Q·K 点积自动只含相对距离 m-n，绝对位置消失。
 > 这也是为什么 RoPE 必须放在 Attention 内部：后续的 Norm/FFN 会破坏正交性。
 > 实现上是分块对角矩阵——48 个 2×2 旋转块，代码里展开成逐元素乘法，没有真正的矩阵乘。
 > 在我写的模型里 head_dim=96 拆成 48 对子空间，base=1e6 配合 YaRN 支持 32k 序列。"
+
+> **YaRN 外推**（如果追问长上下文外推）：
+> "推理长度超过训练长度时，不同频率的维度面临的 OOD 风险不同——高频维度在训练时已经转了几百圈，所有相位都见过，不需要处理；低频维度连一圈都没转完，必须缩放。YaRN 的做法是 NTK-by-parts：用 inv_dim 反函数算出高频和低频的分界线，高频不动、低频除以 factor、中间线性过渡。在我的实现里，48 对维度被分成 pair 0-7 不缩放、pair 8-21 过渡、pair 22-47 全力缩放。这比 Position Interpolation 的暴力等比压缩精细得多——PI 会把高频维度也压缩 16 倍，近距离分辨率直接崩。"

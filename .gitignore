@@ -4,6 +4,7 @@ __pycache__/
 out
 website/
 docs-minimind/
+docs-local/
 
 # Claude Code 本地配置
 .agents/

@@ -1,4 +1,4 @@
-# 14 - Flash Attention
+# 22 - Flash Attention
 
 > 源码位置：`model/model_minimind.py:109, 125-126`（自动切换 Flash Attention）
 > MiniMind 调用了 Flash Attention 但没有手写实现
@@ -6,25 +6,6 @@
 ## 一句话总结
 
 标准 Attention 的瓶颈不是计算而是显存读写（IO bound），Flash Attention 通过分块计算（tiling）避免存储完整的 N×N 注意力矩阵，把 IO 复杂度从 O(N²) 降到 O(N²/M)（M 是 SRAM 大小）。
-
-## MiniMind 中的使用
-
-```python
-# model/model_minimind.py:109
-self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
-
-# model/model_minimind.py:125-126
-if self.flash and ...:
-    output = F.scaled_dot_product_attention(xq, xk, xv,
-        dropout_p=self.dropout if self.training else 0.0,
-        is_causal=self.is_causal)
-else:
-    # 手写的标准 attention
-    scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
-    ...
-```
-
-PyTorch 2.0+ 的 `scaled_dot_product_attention` 会自动调用 Flash Attention kernel（如果硬件支持）。
 
 ## 标准 Attention 的显存问题
 
@@ -37,8 +18,8 @@ PyTorch 2.0+ 的 `scaled_dot_product_attention` 会自动调用 Flash Attention 
 3. O = P × V              → [batch, 8, 768, 96]
 
 显存: 需要把 S 和 P 完整存在 GPU HBM 中
-长序列时: seq_len=4096 → S 矩阵 = 4096² × 8 heads × 4 bytes ≈ 2 GB
-         seq_len=32768 → S 矩阵 ≈ 128 GB → 完全不可行
+长序列时: seq_len=4096  → S 矩阵 = 4096² × 8 heads × 4 bytes ≈ 0.5 GB（加上 P 矩阵翻倍 ≈ 1 GB，单条样本）
+         seq_len=32768 → S 矩阵 = 32768² × 8 × 4 bytes ≈ 34 GB → 单卡放不下
 ```
 
 ## GPU 存储层级（理解瓶颈的关键）
@@ -108,6 +89,27 @@ Flash Attention 的做法：反向时**重新计算** S 和 P（从 Q, K, V 重�
 代价：反向的计算量增加 ~25%
 收益：显存从 O(N²) 降到 O(N)
 
+## MiniMind 中的使用
+
+理解了 Flash Attention 的原理后，看 MiniMind 的代码就很直白——通过 PyTorch 2.0+ 的 `scaled_dot_product_attention` 接口自动调用 Flash Attention kernel（如果硬件支持）：
+
+```python
+# model/model_minimind.py:109
+self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
+
+# model/model_minimind.py:125-126
+if self.flash and ...:
+    output = F.scaled_dot_product_attention(xq, xk, xv,
+        dropout_p=self.dropout if self.training else 0.0,
+        is_causal=self.is_causal)
+else:
+    # 手写的标准 attention
+    scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+    ...
+```
+
+---
+
 ## 面试话术
 
 > Flash Attention 的核心洞察是：标准 Attention 的瓶颈不是计算量而是显存读写。
@@ -132,5 +134,5 @@ Flash Attention 的做法：反向时**重新计算** S 和 P（从 Q, K, V 重�
 |------|---------------------|
 | MiniMind | PyTorch SDPA 自动调用 |
 | LLaMA-3 | Flash Attention v2 |
-| DeepSeek-V3 | 自定义 Flash Attention（适配 MLA 的低秩 KV） |
-| Qwen2.5 | Flash Attention v2 + 滑动窗口变体 |
+| DeepSeek-V3 | 自定义 kernel 适配 MLA（后开源为 FlashMLA） |
+| Qwen2.5 | FlashAttention-2（具体配置未公开） |

@@ -7,93 +7,74 @@
 
 ## 从零开始写
 
-### Step 1：确定组装顺序
+### Step 1：残差连接——为什么每一步都要"加回来"？
 
-一层 Transformer Block 要做两件事：
-1. **token 间交互**（Attention）
-2. **token 独立思考**（FFN）
-
-每件事前后都要加"保护"：
-- **前面**加 RMSNorm → 控制输入范围（Pre-Norm）
-- **后面**加残差连接 → 梯度直通 + 恒等映射兜底
+Block 里最重要的设计之一是残差连接（Residual Connection）。先理解它，后面的代码才看得懂。
 
 ```
-输入 x
-  ├─ 保存 residual = x
-  ├─ RMSNorm(x) → Attention → + residual    ← 第一次：交互 + 保护
+不用残差:  output = f(x)           网络必须从零学习完整变换
+用残差:    output = f(x) + x       网络只需要学习"修正量"
+```
+
+**为什么能防止梯度消失？**
+
+反向传播时，梯度要从最后一层一路乘回第一层。没有残差的情况：
+
+```
+output = f(x)
+d(output)/dx = f'(x)     ← 梯度完全取决于 f'(x)
+
+8 层串联: 梯度 = f1' × f2' × f3' × ... × f8'
+如果每个 f' 都小于 1（比如 0.5），8 层后: 0.5^8 = 0.004 → 梯度几乎消失
+```
+
+加了残差：
+
+```
+output = f(x) + x
+d(output)/dx = f'(x) + 1     ← 多了一个恒为 1 的项
+
+8 层串联: 每一层都有一条 "直通路" 贡献梯度 1
+即使 f'(x) 很小，梯度也不会消失——因为 +1 保底
+```
+
+**这个 +1 就是"梯度高速公路"**——不管 Attention/FFN 内部的梯度有多小，`+ x` 这条路永远通畅，梯度可以直接跳过这一层流到前面去。
+
+**另一个好处：Attention 和 FFN 只需要学"修正量"。** `output = f(x) + x` 意味着 `f(x)` 学的是"在原始表示上做多大的调整"，而不是从零重建完整表示。如果某一层不需要做太多调整，`f(x)` 趋近 0 就行，输出直接等于输入——网络可以自动"跳过"不需要的层。
+
+残差连接是深层网络能训练的关键——ResNet（2015）提出了它，Transformer（2017）继承了。
+
+### Step 2：确定组装顺序
+
+理解了残差连接之后，一层 Block 的结构就清楚了。Pre-Norm 的原理和选择在第 2 章已经讲过（先 Norm 再计算，训练更稳定）。Block 把这两个设计组合起来：每件事用同样的"Pre-Norm + 计算 + 残差"三件套保护：
+
+```
+输入 hidden_states
   │
-  ├─ 保存 residual = 上一步结果
-  ├─ RMSNorm(x) → FFN/MoE  → + residual    ← 第二次：思考 + 保护
-  ↓
-输出（和输入维度完全一样）
+  ├─ 保存 residual = hidden_states
+  ├─ RMSNorm → Attention → 输出 + residual    ← 第一次：token 间交互
+  │
+  ├─ 保存 residual = hidden_states
+  ├─ RMSNorm → FFN/MoE  → 输出 + residual    ← 第二次：token 独立思考
+  │
+输出 hidden_states（和输入维度完全一样 [B, S, 768]）
 ```
 
-### Step 2：写代码
+### Step 3：写代码
 
-```python
-import torch
-from torch import nn
+核心就是两个对称的"Pre-Norm + 计算 + 残差"分支。除了骨架逻辑，forward 还需要传入推理相关的参数：
 
-class MiniMindBlock(nn.Module):
-    def __init__(self, hidden_size=768, n_heads=8, n_kv_heads=4,
-                 head_dim=96, intermediate_size=2432, use_moe=False):
-        super().__init__()
-        self.self_attn = Attention(hidden_size, n_heads, n_kv_heads, head_dim)
-        self.input_layernorm = RMSNorm(hidden_size, eps=1e-6)         # Attention 前
-        self.post_attention_layernorm = RMSNorm(hidden_size, eps=1e-6) # FFN 前
-        self.mlp = MOEFeedForward(...) if use_moe else FeedForward(...)
+| 参数 | 为什么要传 |
+|------|-----------|
+| `position_embeddings` | RoPE 的 cos/sin 值，推理时 KV Cache 会导致位置偏移，需要从外部传入 |
+| `past_key_value` / `use_cache` | KV Cache，推理时只算新 token，复用历史 K/V |
+| `attention_mask` | Padding mask，batch 内不同样本长度不同时需要 |
 
-    def forward(self, hidden_states, position_embeddings,
-                past_key_value=None, use_cache=False, attention_mask=None):
-        # ---- Attention 分支 ----
-        residual = hidden_states                    # 保存输入
+Attention 返回 `(output, past_kv)` 两个值——`past_kv` 是这一层缓存的 K、V 张量，推理时传给下一轮 forward 避免重复计算。
 
-        hidden_states, present = self.self_attn(
-            self.input_layernorm(hidden_states),    # 先 Norm 再算（Pre-Norm）
-            position_embeddings,
-            past_key_value, use_cache, attention_mask
-        )
+#### 关于命名
 
-        hidden_states = hidden_states + residual    # 残差连接
-
-        # ---- FFN 分支 ----
-        hidden_states = hidden_states + self.mlp(
-            self.post_attention_layernorm(hidden_states)  # 先 Norm 再算
-        )
-
-        return hidden_states, present
-```
-
-就这么多——17 行核心逻辑。
-
-### Step 3：理解 Pre-Norm 的选择
-
-```
-Pre-Norm（我们用的）:    output = x + Attention(Norm(x))    先 Norm 再计算
-Post-Norm（原始 Transformer）:  output = Norm(x + Attention(x))  先计算再 Norm
-```
-
-| 对比 | Pre-Norm | Post-Norm |
-|------|---------|----------|
-| 训练稳定性 | 好（Norm 控制了输入范围） | 差（需要 warmup） |
-| 表达能力 | 理论略弱 | 理论更强 |
-| 深层网络 | 优势明显 | 容易梯度爆炸 |
-| 使用方 | LLaMA/Qwen/DeepSeek/GPT-3 | BERT/原始 Transformer |
-
-所有主流 LLM 都用 Pre-Norm——大模型层数多（几十到上百层），训练稳定性是第一优先级。
-
-### Step 4：理解残差连接的作用
-
-```python
-hidden_states = hidden_states + residual  # output = f(x) + x
-```
-
-三个作用：
-1. **梯度直通**：反向传播时梯度可以跳过 Attention/FFN 直接流到前面的层 → 缓解梯度消失
-2. **恒等映射兜底**：如果 Attention/FFN 学不到有用的东西，输出至少等于输入（不会变差）
-3. **增量学习**：Attention 和 FFN 学的是"在原始表示上的**修正量**"，而不是从零重建
-
-没有残差连接，8 层网络几乎训不动；有了残差连接，即使 100+ 层也能稳定训练。
+前面的底层组件（Attention、FeedForward、RMSNorm）都用 `x`——它们是通用组件，不关心自己在模型里的位置。从 Block 开始往上（Block → Model），用 `hidden_states` 表示"在各层之间流动的隐藏状态"，和 HuggingFace Transformers 的命名惯例一致（LLaMA、Qwen、Mistral 源码都这样）。功能上没区别，纯粹是为了上下游代码读起来连贯。
 
 ## 维度追踪
 
@@ -134,40 +115,50 @@ FFN (SwiGLU):
 RMSNorm × 2:        1,536（可忽略）
 
 每层合计:            ≈ 7.4M
-8 层合计:            ≈ 59.2M
+8 层合计:            ≈ 59.0M
 ```
 
 **FFN 参数量是 Attention 的 3 倍多**——模型的大部分参数在 FFN 里，不在 Attention 里。
 
-## 完整验证
+## 代码实现
 
-> 📁 追加到 `scratch/model/model_minimind.py`（RMSNorm、FeedForward 前面已定义，这里只追加 MiniMindBlock）
+> 📁 `scratch/model/model_minimind.py` 中的 MiniMindBlock，直接复用手写 Attention、FeedForward、MOEFeedForward。
 
 ```python
-class SimpleBlock(nn.Module):
-    def __init__(self, hidden_size=768, n_heads=8, intermediate_size=2432):
+class MiniMindBlock(nn.Module):
+    def __init__(self, layer_id, config: MiniMindConfig):
         super().__init__()
-        self.norm1 = RMSNorm(hidden_size)
-        self.norm2 = RMSNorm(hidden_size)
-        self.attn = nn.MultiheadAttention(hidden_size, n_heads, batch_first=True)
-        self.ffn = FeedForward(hidden_size, intermediate_size)
+        self.self_attn = Attention(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
-    def forward(self, x):
+    def forward(self, hidden_states, position_embeddings,
+                past_key_value=None, use_cache=False, attention_mask=None):
         # Pre-Norm + Attention + 残差
-        normed = self.norm1(x)
-        mask = nn.Transformer.generate_square_subsequent_mask(x.size(1), device=x.device)
-        attn_out, _ = self.attn(normed, normed, normed, attn_mask=mask, is_causal=True)
-        x = x + attn_out
+        residual = hidden_states
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings, past_key_value, use_cache, attention_mask,
+        )
+        hidden_states = hidden_states + residual
 
         # Pre-Norm + FFN + 残差
-        x = x + self.ffn(self.norm2(x))
-        return x
+        hidden_states = hidden_states + self.mlp(
+            self.post_attention_layernorm(hidden_states)
+        )
+        return hidden_states, present_key_value
 
-block = SimpleBlock()
+# 验证
+config = MiniMindConfig()
+block = MiniMindBlock(0, config)
 x = torch.randn(2, 128, 768)
-out = block(x)
+cos, sin = precompute_freqs_cis(96, 128)
+out, kv = block(x, (cos, sin), use_cache=True)
 assert out.shape == x.shape
-print("Block verified!")
+assert kv[0].shape == (2, 128, 4, 96)  # KV Cache: [B, S, n_kv_heads, head_dim]
+print(f"Block params: {sum(p.numel() for p in block.parameters()):,}")  # 7,374,528
+print("MiniMindBlock verified!")
 ```
 
 ## 对照 MiniMind 源码
@@ -179,7 +170,7 @@ print("Block verified!")
 | Pre-Norm + 残差 | 完全一致 |
 | MoE 选择 `if not use_moe` | `model_minimind.py:183` |
 
-结构完全一致——所有主流大模型的 Block 几乎一模一样，差异在 Attention 和 FFN 的内部实现。
+与上游完全一致——使用手写的 GQA Attention（含 KV Cache、SDPA）、SwiGLU FeedForward、MoE 分支。
 
 ## 业界对比
 
@@ -187,8 +178,8 @@ print("Block verified!")
 |------|---------|---------|---------|-------------|
 | Norm | Pre-RMSNorm | Pre-RMSNorm | Pre-RMSNorm | Pre-RMSNorm |
 | FFN | SwiGLU/MoE | SwiGLU | SwiGLU | MoE |
-| QK Norm | 有 | 无 | 有 | 有 |
-| 每层 Norm 数 | 2 | 2 | 2 | 2 |
+| QK Norm | 有（q_norm/k_norm） | 无 | 无（Qwen2 无显式 QK Norm） | 有（latent RMSNorm，非标准 QK Norm） |
+| 残差主干 Norm 数 | 2 | 2 | 2 | 2 |
 
 ## 面试话术
 

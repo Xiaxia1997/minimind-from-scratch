@@ -45,15 +45,15 @@ hidden_states = hidden_states + self.mlp(
 )
 ```
 
-### 为什么现在全用 Pre-Norm？
+### 为什么绝大多数主流 LLM 用 Pre-Norm？
 
 | 维度 | Post-Norm | Pre-Norm |
 |------|-----------|----------|
 | 梯度通路 | 梯度必须穿过 Norm 层 | 残差直连，梯度畅通无阻 |
-| 训练稳定性 | 深层模型容易崩，需要精心 warmup | 几十上百层都能稳定训练 |
-| 学习率敏感度 | 非常敏感 | 宽容得多 |
-| 理论表达能力 | 略强（有论文证明） | 略弱 |
-| 工程结论 | **稳定性的收益远大于理论表达力的微小差距** | **业界标配** |
+| 训练稳定性 | 深层时更依赖 warmup、初始化或残差缩放等技巧 | 初始化阶段梯度通常更平稳 |
+| 学习率敏感度 | 更敏感 | 宽容得多 |
+| 理论表达能力 | 某些研究观察到略强 | 某些研究观察到略弱 |
+| 工程结论 | **稳定性的收益远大于理论表达力的微小差距** | **绝大多数主流 LLM 的选择** |
 
 ### 面试话术（Pre-Norm vs Post-Norm）
 
@@ -63,10 +63,9 @@ hidden_states = hidden_states + self.mlp(
 
 ## 为什么需要归一化？
 
-深层网络的核心问题：每一层的输入分布会随训练不断漂移（Internal Covariate Shift）。
-如果不做归一化，第 8 层收到的数值范围可能和第 1 层完全不同——训练不稳定、梯度爆炸/消失。
+深层网络的核心问题：随着层数加深，激活值的尺度可能逐层漂移，导致训练不稳定、梯度爆炸/消失。
 
-归一化的作用：**把每层的输入拉回到一个稳定的数值范围**，让后续的计算（Attention、FFN）在可预期的数值区间内工作。
+归一化的作用：**控制每层激活值的尺度，改善优化条件和数值稳定性**，让后续的计算（Attention、FFN）在可预期的数值区间内工作。
 
 ## 从零开始写
 
@@ -86,7 +85,7 @@ LayerNorm(x) = (x - mean) / std * γ + β
 
 ### Step 2：简化为 RMSNorm
 
-论文 [Zhang & Sennrich, 2019] 发现：**re-centering（减均值）对训练几乎没有贡献**，去掉后计算效率提升 10-40%，效果一样。
+论文 [Zhang & Sennrich, 2019] 提出假设：**re-centering invariance 可能不是归一化的必要成分**。实验显示 RMSNorm 在多个任务上取得可比表现，运行时间减少约 7%–64%（因模型和硬件而异）。
 
 RMSNorm 只保留 re-scaling：
 
@@ -110,8 +109,11 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))  # γ，初始全 1（不改变原始分布）
 
     def norm(self, x):
-        # x.pow(2).mean(-1, keepdim=True) → 沿 hidden_dim 求 x² 的均值
-        # torch.rsqrt → 1/sqrt，比 sqrt+除法更快（GPU 上一条指令）
+        # x.pow(2).mean(-1, keepdim=True) → 沿 hidden_dim（最后一维）求 x² 的均值
+        #   keepdim=True: 保留被压缩的维度为 size=1，而不是删掉它
+        #     有 keepdim: [B, S, 768] → [B, S, 1]  ← 能和原始 x [B, S, 768] 正确广播相乘
+        #     没 keepdim: [B, S, 768] → [B, S]     ← 少一维，乘法会报错或语义错误
+        # torch.rsqrt → 1/sqrt，避免显式的 sqrt+除法，通常更利于后端优化
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
@@ -121,7 +123,7 @@ class RMSNorm(nn.Module):
 ```
 
 两个工程细节：
-1. **`torch.rsqrt`** 代替 `1/sqrt`：GPU 上 rsqrt 是单条指令，比 sqrt 再除更快
+1. **`torch.rsqrt`** 代替 `1/sqrt`：避免显式的 sqrt+除法，通常更利于后端优化
 2. **`.float()` 再 `.type_as(x)`**：混合精度训练时输入是 bf16/fp16，但 rsqrt 对低精度敏感，先转 fp32 保数值稳定
 
 ### Step 4：验证
@@ -144,10 +146,10 @@ print(f"RMS after norm: {rms.mean():.4f}")  # 应接近 1.0
 **为什么结果接近 1？** γ 初始化为全 1，所以 `out = x / RMS(x)`，再对 out 求 RMS：
 
 ```
-RMS(out) = RMS(x / RMS(x)) = RMS(x) / RMS(x) = 1
+RMS(out) = sqrt(mean(x²) / (mean(x²) + eps)) ≈ 1   （eps 很小时接近 1，但不严格等于 1）
 ```
 
-除以自己的 RMS，结果的 RMS 当然是 1——就像向量除以自己的模长变成单位向量一样。**这就是归一化的定义：把幅度缩放到 1**。
+注意这不等于"向量变成单位向量"——RMSNorm 后的 L2 范数约为 `sqrt(hidden_size)`，不是 1。归一化的目标是**让 RMS 接近 1（单位 RMS）**，从而控制激活值的尺度。
 
 ## 在完整模型中的位置
 
@@ -210,17 +212,17 @@ Embedding 输出 → 数值范围 OK
 | BERT | LayerNorm + Post-Norm | 同上 |
 | LLaMA/Qwen/DeepSeek | RMSNorm + Pre-Norm | 无 QK Norm |
 | MiniMind | RMSNorm + Pre-Norm | 有 QK Norm |
-| Gemma 2 | RMSNorm + Pre-Norm | 有 QK Norm |
+| Gemma 2 | RMSNorm + Pre-Norm | query_pre_attn_scalar + logit soft-capping（非显式 QK Norm） |
 
 ## 面试话术
 
 > "RMSNorm 是 LayerNorm 的简化版，去掉了 re-centering（减均值）只保留 re-scaling（除均方根）。
-> 论文发现减均值对训练几乎没有贡献，去掉后计算效率提升 10-40%。
+> 论文假设 re-centering 不是必需的，实验显示效果可比，运行时间减少约 7%–64%。
 > 实现上就是 x 乘以 rsqrt(mean(x²) + eps)，再乘一个可学习的缩放参数 γ。
 > 工程上注意两点：一是先转 float32 再算 norm 防精度丢失，二是用 rsqrt 代替 sqrt+除法在 GPU 上更快。
 > LLaMA、Qwen、DeepSeek 等主流开源模型全部用 RMSNorm 替代了 LayerNorm。"
 
 ## 延伸问题
 
-- **QK Norm**：我们在 Attention 里对 Q 和 K 也做了 RMSNorm（`q_norm`/`k_norm`），防止注意力分数爆炸，Gemma 2 也用了这个技巧（详见 [04-Attention](04-Attention.md)）
+- **QK Norm**：我们在 Attention 里对 Q 和 K 也做了 RMSNorm（`q_norm`/`k_norm`），防止注意力分数爆炸（详见 [04-Attention](04-Attention.md)）
 - **Pre-Norm vs Post-Norm**：详见本文开头章节

@@ -1,4 +1,4 @@
-# 15 - Gradient Checkpointing（梯度检查点 / 激活重计算）
+# 23 - Gradient Checkpointing（梯度检查点 / 激活重计算）
 
 > MiniMind 没有实现此功能
 > 本文补充面试知识空白

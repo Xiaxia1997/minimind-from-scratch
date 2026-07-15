@@ -14,26 +14,42 @@
 
 ## 从零开始写
 
-### Step 1：最简 Embedding
+### Step 1：Embedding 全貌
+
+先看完整的验证代码，然后逐个解释每个组件（Step 2~4）：
 
 ```python
 import torch
 from torch import nn
 
-vocab_size = 6400    # 词表大小：能认多少个"字"
-hidden_size = 768    # 每个字映射成多长的向量
+if __name__ == '__main__':
+    vocab_size = 6400    # 词表大小
+    hidden_size = 768    # 每个 token 映射成多长的向量
 
-embed_tokens = nn.Embedding(vocab_size, hidden_size)
-# 本质：一个 [6400, 768] 的可学习矩阵
-# 每一行是一个 token 的向量表示，初始随机，训练中更新
+    embed_tokens = nn.Embedding(vocab_size, hidden_size)      # 入口：token id → 向量
+    lm_head = nn.Linear(hidden_size, vocab_size, bias=False)  # 出口：向量 → logits
+    embed_tokens.weight = lm_head.weight                      # Weight Tying（Step 4 详解）
+    dropout = nn.Dropout(0.0)                                 # 防过拟合（Step 3 详解）
+
+    input_ids = torch.randint(0, vocab_size, (2, 128))   # [batch=2, seq_len=128]
+    hidden_states = dropout(embed_tokens(input_ids))     # [2, 128, 768]
 ```
 
-nn.Embedding 没有任何计算——纯查表。`embed_tokens(3)` 就是取第 3 行。
+**nn.Embedding** 没有任何计算——纯查表。权重矩阵 `[6400, 768]`，`embed_tokens(3)` 就是取第 3 行。每一行是一个 token 的向量表示，初始随机，训练中更新。
 
-```python
-input_ids = torch.tensor([[1, 42, 7, 100]])  # [batch=1, seq_len=4]
-hidden_states = embed_tokens(input_ids)       # [1, 4, 768]
+**input_ids 从哪来？** 原始文本先经过 Tokenizer（分词器）切分并映射成整数 id：
+
 ```
+原始文本:  "我喜欢深度学习"
+    ↓ Tokenizer（MiniMind 用 BPE 分词，词表大小 6400）
+token 序列: ["我", "喜欢", "深度", "学习"]
+    ↓ 查词表，每个 token 对应一个 id
+input_ids:  [42, 1803, 567, 234]
+    ↓ Embedding 查表
+hidden_states: [[vec_42], [vec_1803], [vec_567], [vec_234]]   ← [1, 4, 768]
+```
+
+Tokenizer 是独立的预处理步骤，不在模型里。这里还没加载分词器，验证时用 `torch.randint` 随机生成 id。
 
 ### Step 2：要不要在这里加位置编码？
 
@@ -46,7 +62,7 @@ hidden_states = embed_tokens(input_ids)       # [1, 4, 768]
 - RoPE 利用 Q·K 点积的正交性，天然编码**相对距离**而非绝对位置
 - 如果加在 Embedding 层，后续的 Norm/FFN 等非线性操作会破坏旋转矩阵的正交性
 
-所以 Embedding 输出的向量**不含任何位置信息**——纯语义。
+所以 Embedding 输出的向量**不含显式的位置编码**——位置信息留给 RoPE 在 Attention 内部注入。
 
 ```
 我们的设计:
@@ -57,15 +73,9 @@ hidden_states = embed_tokens(input_ids)       # [1, 4, 768]
     Q, K = apply_rotary_pos_emb(Q, K, cos, sin)   ← 位置信息在这里才注入
 ```
 
-### Step 3：加 Dropout
+### Step 3：Dropout——为什么 Step 1 里 `nn.Dropout(0.0)` 等于没用？
 
-训练时随机把一些维度置零，防过拟合：
-
-```python
-dropout = nn.Dropout(0.0)  # MiniMind 默认 0.0，但架构里留了这个口子
-hidden_states = dropout(embed_tokens(input_ids))
-# [batch, seq_len, 768]
-```
+Step 1 代码中的 `dropout = nn.Dropout(0.0)` 训练时随机把一些维度置零，防过拟合。MiniMind 默认 0.0，等于空操作——架构上留了口子，需要时通过 `config.dropout` 打开。
 
 #### Dropout 是什么？解决什么问题？
 
@@ -91,51 +101,31 @@ mask:  [ 1,   0,   1,   1,   0 ]    ← 随机生成
 
 #### 为什么 MiniMind 默认 dropout=0.0（不用）？
 
-这是现代大模型的普遍做法——**GPT-3、LLaMA、Qwen、DeepSeek 在预训练阶段都不用 dropout。**
+GPT-3、LLaMA、Qwen、DeepSeek 在预训练阶段的公开配置中 dropout 都设为 0.0。常见的考量：
 
 | 因素 | 解释 |
 |------|------|
-| 数据量足够大 | 预训练数据几百 GB~TB 级，模型难过拟合，dropout 的正则化不必要 |
-| 训练效率 | dropout 让梯度估计方差变大，需要更多步数收敛，大模型训练本来就贵 |
-| 模型容量不浪费 | 大模型参数量相对数据量并不过剩，不需要人为限制容量 |
-| 其他正则化替代 | RMSNorm、权重衰减（weight decay）、数据增强已提供足够正则化 |
+| 数据量足够大 | 预训练数据几百 GB~TB 级，模型较难过拟合，dropout 的正则化收益有限 |
+| 训练效率 | dropout 让梯度估计方差变大，可能需要更多步数收敛 |
+| 模型容量 | 大模型参数量相对数据量并不过剩，不需要人为限制容量 |
+| 其他正则化手段 | 权重衰减（weight decay）、数据增强等提供正则化；RMSNorm 主要作用是稳定优化而非正则化 |
 
 #### 各训练阶段的 dropout 策略
 
 | 阶段 | 是否用 dropout | 原因 | 实锤 |
 |------|---------------|------|------|
-| 预训练 | 不用（0.0） | 数据量大，不易过拟合 | LLaMA/Qwen/DeepSeek config 均无 dropout |
-| 全参 SFT | 不用（0.0） | 更新所有参数，和预训练一致 | LLaMA 1/2 论文全文未提 dropout；transformers 源码 LlamaConfig/Qwen2Config 默认 attention_dropout=0.0；主流训练框架全参 SFT 不修改此值 |
-| LoRA/QLoRA SFT | 用（lora_dropout=0.05~0.1） | 只更新低秩矩阵，可训练参数少，小数据集易过拟合 | peft 库常见配置 |
-| DPO/GRPO/PPO | 不用（0.0） | policy gradient 本身方差就大，dropout 再加随机性会训练不稳定；且 ref_model 是 eval 模式（dropout 关闭），policy model 开 dropout 会让 KL 估计有偏 | MiniMind 代码无 dropout 设置 |
-| Agent RL | 不用（0.0） | 同上 | 同上 |
+| 预训练 | 通常 0.0 | 数据量大，过拟合风险低 | LLaMA/Qwen/DeepSeek config 默认 0.0 |
+| 全参 SFT | 通常 0.0 | 更新所有参数，和预训练保持一致 | 主流训练框架全参 SFT 不修改此值 |
+| LoRA/QLoRA SFT | 常见 0.05~0.1 | 可训练参数少，小数据集容易过拟合 | peft 库常见配置 |
+| DPO/GRPO/PPO | 通常 0.0 | policy gradient 本身方差大，dropout 加随机性可能不稳定 | MiniMind 代码无 dropout 设置 |
+| Agent RL | 通常 0.0 | 同上 | 同上 |
 
 MiniMind 代码里 dropout 出现在 3 个位置（Embedding 后、Attention 权重上、Attention 输出），但因为默认 0.0，全部等于空操作——架构上留了口子，需要时可以通过 `config.dropout` 打开。
 
-### Step 4：Weight Tying——首尾共享权重
+### Step 4：Weight Tying——为什么 Step 1 里 Embedding 和 LM Head 共享权重？
 
-模型最后一层是 LM Head，作用是把 768 维向量映射回 vocab_size 维的 logits：
+Step 1 代码中 `lm_head = nn.Linear(hidden_size, vocab_size, bias=False)` 是模型出口，把 768 维向量映射回 vocab_size 维的 logits（每个 token 的得分）。紧接着 `embed_tokens.weight = lm_head.weight` 让两者共享同一个 `[6400, 768]` 权重矩阵。
 
-```python
-lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
-# 权重矩阵: [6400, 768] — 和 Embedding 一模一样的形状
-# 计算方式: 把输入向量和 W 的每一行做点积，得到 6400 个得分
-```
-
-#### 为什么 LM Head 要用 nn.Linear 而不是 nn.Embedding？
-
-两者的权重形状一样都是 `[6400, 768]`，但**能做的操作完全不同**。
-
-用一个 vocab_size=4、hidden_size=3 的迷你例子说明：
-
-```
-权重矩阵 W（4 个 token，每个 3 维）:
-         dim0   dim1   dim2
-token 0: [0.1,   0.2,   0.3]    ← "我"
-token 1: [0.8,   0.1,   0.5]    ← "你"
-token 2: [0.3,   0.9,   0.2]    ← "他"
-token 3: [0.6,   0.4,   0.7]    ← "她"
-```
 
 **nn.Embedding 只能做一件事：给 id，取一行**
 ```
@@ -160,27 +150,17 @@ score_3 = 0.5×0.6 + 0.6×0.4 + 0.4×0.7 = 0.82   ← h 和"她"有多像 ✓✓
 → softmax 后"她"概率最高，预测下一个 token 是"她"
 ```
 
-**总结：**
-| | nn.Embedding | nn.Linear |
-|---|---|---|
-| 输入 | token id（整数） | 向量（浮点数） |
-| 操作 | 按 id 取行（查表） | 向量和每行做点积（匹配） |
-| 输出 | 一个向量 [hidden_size] | 每个 token 的得分 [vocab_size] |
-| 模型入口用 | ✅ 把 token 变成向量 | ❌ 输入是 id 不是向量 |
-| 模型出口用 | ❌ 输入是向量不是 id | ✅ 把向量变成各 token 的得分 |
 
 #### 为什么能共享权重？
 
-nn.Embedding 和 nn.Linear 的权重**存储形状完全相同**，都是 `[6400, 768]`。
-第 i 行的含义也一样——都是 **token i 的 768 维向量**，只是用法不同（取行 vs 点积）。
+数学视角:  h @ W = [1, 768] @ [768, 6400] = [1, 6400]
 
-所以直接共享，不需要转置或求逆：
+PyTorch 实现:  h @ W_stored.T = [1, 768] @ [6400, 768].T = [1, 6400]
+               存储形状 [6400, 768]，计算时内部转置
 
-```python
-embed_tokens.weight = lm_head.weight  # 共享同一个 [6400, 768] 张量
-```
+能共享的原因：PyTorch 的 Linear 恰好把权重按行存（每行是一个输出神经元的权重向量），而 Embedding 也是按行存（每行是一个 token 的向量）。两者都是 [6400, 768]，第 i 行都表示 token i 的 768 维向量——只是用法不同（取行 vs 点积）。如果 Linear 按数学惯例存 [768, 6400]，就没法直接共享了。
 
-对于 64M 的小模型，省掉 ~490 万参数（占 ~8%），很值得。
+所以直接共享（Step 1 中的 `embed_tokens.weight = lm_head.weight`），不需要转置或求逆。对于 64M 的小模型，省掉 ~490 万参数（占 ~8%），很值得。
 
 > 📊 [可视化图解：nn.Linear 为什么反着存权重](https://claude.ai/code/artifact/3170599b-2d40-48b2-b723-87664a328d21)
 
@@ -198,45 +178,40 @@ embed_tokens.weight = lm_head.weight  # 共享同一个 [6400, 768] 张量
 ## 完整实现
 
 > 📁 代码写在 `scratch/model/model_minimind.py`，这是第一个组件，新建文件。
+>
+> Embedding 不单独封装成类——`embed_tokens`、`dropout`、`lm_head` 在真实模型中是主模型类的直接属性（step 8 组装时放进去），这里先用裸组件写验证。
 
 ```python
 import torch
 from torch import nn
 
-class TokenEmbedding(nn.Module):
-    def __init__(self, vocab_size=6400, hidden_size=768, dropout=0.0,
-                 tie_weights=True):
-        super().__init__()
-        self.embed_tokens = nn.Embedding(vocab_size, hidden_size)
-        self.dropout = nn.Dropout(dropout)
-        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+# 这三个组件在 step 8 会成为主模型类的属性，这里先裸写验证逻辑
+if __name__ == '__main__':
+    vocab_size = 6400
+    hidden_size = 768
 
-        if tie_weights:
-            self.embed_tokens.weight = self.lm_head.weight
+    embed_tokens = nn.Embedding(vocab_size, hidden_size)
+    lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+    embed_tokens.weight = lm_head.weight  # Weight Tying
 
-    def embed(self, input_ids):
-        # input_ids: [batch, seq_len] 整数
-        # return:    [batch, seq_len, hidden_size] 向量
-        return self.dropout(self.embed_tokens(input_ids))
+    input_ids = torch.randint(0, vocab_size, (2, 128))  # [batch=2, seq_len=128]
+    dropout = nn.Dropout(0.0)
+    hidden_states = dropout(embed_tokens(input_ids))
 
-    def to_logits(self, hidden_states):
-        # hidden_states: [batch, seq_len, hidden_size]
-        # return:        [batch, seq_len, vocab_size] logits
-        return self.lm_head(hidden_states)
-
-
-# 验证
-model = TokenEmbedding()
-ids = torch.randint(0, 6400, (2, 128))      # [2, 128]
-h = model.embed(ids)                          # [2, 128, 768]
-logits = model.to_logits(h)                   # [2, 128, 6400]
-
-assert h.shape == (2, 128, 768)
-assert logits.shape == (2, 128, 6400)
-assert model.embed_tokens.weight is model.lm_head.weight  # 确认共享
-print(f"Embedding params: {model.embed_tokens.weight.numel():,}")  # 4,915,200
-print("Embedding verified!")
+    assert hidden_states.shape == (2, 128, 768)
+    assert embed_tokens.weight is lm_head.weight
+    print("Embedding + LM Head verified!")
 ```
+
+**文件组织：`if __name__ == '__main__'`**
+
+验证代码必须放在 `if __name__ == '__main__':` 块中。原因：
+
+- `scratch/model/model_minimind.py` 会被后续章节不断追加新组件（RMSNorm、Attention、FFN...）
+- 如果验证代码散落在模块级别，每次 `import` 都会执行——后续章节追加的类还没定义就会报错
+- 放在 `__main__` 块里，只有直接运行 `python scratch/model/model_minimind.py` 时才执行验证
+
+后续每章追加新组件时，在 `__main__` 块末尾追加对应的验证代码即可。
 
 ## 对照 MiniMind 源码
 
@@ -256,4 +231,4 @@ MiniMind 的 Embedding 实现和我们完全一致——就是这么简单。
 > 如果加在 Embedding 层，后续的 Norm/FFN 会破坏这个性质。
 > 工程上用了 Weight Tying——Embedding 和 LM Head 共享权重，
 > 因为它们是同一个语义空间的正反映射，共享省了近 500 万参数，
-> 对 64M 的小模型占比不小。LLaMA、Qwen 大模型则不共享，因为参数充足，分开效果更好。"
+> 对 64M 的小模型占比不小。LLaMA、Qwen 等大模型选择不共享，具体效果差异需要消融实验判断。"
