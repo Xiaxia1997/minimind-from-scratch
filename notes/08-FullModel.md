@@ -128,6 +128,37 @@ token ids [B, S]
 
 训练时 `past_key_values=None`，每层独立算完整序列。推理时通过这个列表实现增量计算。
 
+#### KV Cache 的数据结构
+
+8 层这个维度**不在张量里面**，是用 Python 列表的下标区分的。每个 K 和 V 本身是正常的 4D 张量：
+
+```
+past_key_values = [
+    (K0, V0),     ← 第 0 层，K0.shape = [B, S_cached, n_kv_heads, head_dim]
+    (K1, V1),     ← 第 1 层           = [1,    10,        4,         96   ]
+    ...
+    (K7, V7),     ← 第 7 层
+]
+```
+
+为什么不做成一个 `[n_layers, B, S, n_kv_heads, head_dim]` 的大张量？因为各层是串行的——第 0 层算完 `hidden_states` 才能送进第 1 层，每层独立更新自己的缓存。用列表方便逐层取、逐层拼接。
+
+#### 训练时的 `[None] * 8`
+
+```python
+past_key_values = past_key_values or [None] * len(self.layers)
+```
+
+训练时 `past_key_values` 参数没传（默认 `None`），这行把它变成 `[None, None, ..., None]`（8 个 `None`）。推理时传进来 `[(K0,V0), ...]` 则保持不变。这样后面的循环只需写一遍：
+
+```python
+for layer, past_kv in zip(self.layers, past_key_values):
+    # 训练时 past_kv = None → Attention 里跳过 cat 拼接
+    # 推理时 past_kv = (K, V) → Attention 里做 cat 拼接历史缓存
+```
+
+分支逻辑被推到 Attention 内部（第 4 章写的 `if past_key_value is not None: xk = torch.cat(...)`），Model 层面不需要 if/else 区分训练和推理。
+
 同时还要算 `start_pos`——当前序列在 RoPE 频率表中的起始位置。训练时 `start_pos=0`（从头算），推理第 200 步时 `start_pos=199`（因为前 199 个 token 的 KV 已经在 cache 里了，新 token 的位置编号是 199）。
 
 理解了这两个问题，代码就很直白了：
@@ -266,8 +297,11 @@ class MiniMindForCausalLM(nn.Module):
             y = labels[..., 1:].contiguous()       # [B, S-1]
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
 
-        return {'loss': loss, 'aux_loss': aux_loss, 'logits': logits,
-                'past_key_values': past_key_values}
+        from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+        return MoeCausalLMOutputWithPast(
+            loss=loss, aux_loss=aux_loss, logits=logits,
+            past_key_values=past_key_values, hidden_states=hidden_states,
+        )
 ```
 
 ### Step 4：generate——让模型自己说话
@@ -292,18 +326,159 @@ class MiniMindForCausalLM(nn.Module):
 
 #### 采样策略
 
-生成时不能简单地取概率最高的 token（贪心），否则输出会很无聊、容易重复。MiniMind 用四种策略叠加：
+生成时不能简单地取概率最高的 token（贪心），否则输出会很无聊、容易重复。MiniMind 用四种策略**按顺序叠加**：
 
-| 策略 | 做什么 | 效果 |
-|------|--------|------|
-| Temperature | logits 除以 T | T > 1 更随机，T < 1 更确定 |
-| Top-K | 只保留分数最高的 K 个 | 砍掉长尾噪声 |
-| Top-P (Nucleus) | 按概率从高到低，保留累积概率达到 P 的最小集合 | 比 Top-K 更灵活——概率集中时候选少，分散时候选多 |
-| Repetition Penalty | 降低已出现 token 的分数 | 减少重复 |
+```
+原始 logits [B, 6400]
+  → ① Temperature（调节分布锐度）
+  → ② Repetition Penalty（压低已出现 token）
+  → ③ Top-K（砍到最多 50 个）
+  → ④ Top-P（在剩余候选中按累积概率再砍）
+  → ⑤ Softmax → 采样
+```
 
-MiniMind 默认同时使用：`temperature=0.85, top_p=0.85, top_k=50`。
+每一步都是在修改 logits，最终 softmax 一次、采样一次。不是选一个策略用，是全部串联。
+
+##### ① Temperature
+
+Softmax 的标准公式是：
+
+$$P(token_i) = \frac{e^{z_i}}{\sum_j e^{z_j}}$$
+
+Temperature 做的事情是在 softmax **之前**把 logits 除以 $T$：
+
+$$P(token_i) = \frac{e^{z_i / T}}{\sum_j e^{z_j / T}}$$
+
+用具体数字看效果。假设 3 个候选 token 的原始 logits 是 `[5.0, 3.0, 1.0]`：
+
+| Temperature | 除以 T 后 | Softmax 概率 | 效果 |
+|-------------|----------|-------------|------|
+| T=1.0 | [5.0, 3.0, 1.0] | [0.84, 0.11, 0.02] | 原始分布 |
+| T=0.5 | [10.0, 6.0, 2.0] | [0.98, 0.02, 0.00] | 差距拉大，几乎贪心 |
+| T=0.85（MiniMind） | [5.9, 3.5, 1.2] | [0.89, 0.09, 0.01] | 略确定 |
+| T=2.0 | [2.5, 1.5, 0.5] | [0.57, 0.21, 0.08] | 差距缩小，更随机 |
+
+直觉：指数函数 $e^x$ 对大值增长极快。除以 $T$ 相当于缩放指数的"倍率"——$T < 1$ 放大差距让赢家通吃，$T > 1$ 压缩差距让弱者也有机会。
+
+代码只有一行：
 
 ```python
+logits = outputs['logits'][:, -1, :] / temperature  # [B, 6400]
+```
+
+注意这是在 softmax **之前**除的，不是之后。之后再除没有上面的效果。
+
+##### ② Repetition Penalty
+
+来自论文 *CTRL (Keskar et al., 2019)*。思路：已经出现过的 token，在 logits（就是 LM Head 输出的原始分数 $z_i$，softmax 之前的值）上施加惩罚，降低它再次被选中的概率。
+
+$$z_i' = \begin{cases} z_i / \theta & \text{if } z_i > 0 \text{ and token}_i \in \text{已生成} \\ z_i \times \theta & \text{if } z_i < 0 \text{ and token}_i \in \text{已生成} \\ z_i & \text{otherwise（没出现过的 token 不动）} \end{cases}$$
+
+$\theta$ 就是 `repetition_penalty` 参数，**必须 ≥ 1.0**：
+
+| $\theta$ 值 | 效果 | 说明 |
+|-------------|------|------|
+| 1.0（默认）| 不惩罚 | 除以 1 等于没除，乘以 1 等于没乘 |
+| 1.2 | 轻度防重复 | 常用值 |
+| 1.5 | 中度防重复 | 明显降低重复 |
+| 2.0+ | 强力防重复 | 可能导致语句不通顺，因为常用词也被压低了 |
+
+为什么正分除、负分乘？因为目标是**压低**已出现 token 的分数，而 $\theta \geq 1.0$：
+- 正分 5.0 → 除以 1.2 → 4.17（正数除以大于 1 的数变小，概率降低）
+- 负分 -2.0 → 乘以 1.2 → -2.4（负数乘以大于 1 的数更负，概率也降低）
+
+两种操作方向不同，但效果一致：都是在压低。如果统一用除法，负分 -2.0 / 1.2 = -1.67，反而变大了（更接近 0），概率反升——所以必须分开处理。
+
+```python
+if repetition_penalty != 1.0:
+    for i in range(input_ids.shape[0]):
+        seen = torch.unique(input_ids[i])     # 这个序列中出现过的所有 token id
+        score = logits[i, seen]
+        logits[i, seen] = torch.where(
+            score > 0,
+            score / repetition_penalty,        # 正分除以 θ（变小）
+            score * repetition_penalty          # 负分乘以 θ（更负）
+        )
+```
+
+典型取值：1.0（不惩罚）、1.1-1.3（轻度防重复）、2.0+（强力防重复，可能导致语句不通顺）。
+
+##### ③ Top-K
+
+保留分数最高的 K 个 token，其余全部设为 $-\infty$（softmax 后概率趋近 0）。
+
+```
+Top-K=50 之前: 6400 个 token 都有分数
+Top-K=50 之后: 只剩 50 个有效候选
+```
+
+问题：K 是固定的。不管模型有多确定（一个 token 概率 0.99）还是多犹豫（前 100 个概率差不多），都保留 50 个。确定时浪费候选，犹豫时可能不够。
+
+##### ④ Top-P (Nucleus Sampling)
+
+来自论文 *The Curious Case of Neural Text Degeneration (Holtzman et al., 2020)*。解决 Top-K 的固定候选问题——**按累积概率动态决定保留多少个**。
+
+算法：把 token 按概率从高到低排序，逐个累加，当累积概率首次超过 $P$ 时，后面的全部砍掉。
+
+```
+经过 Top-K 后剩 50 个 token，softmax 概率：
+  token_A: 0.40
+  token_B: 0.25
+  token_C: 0.12
+  token_D: 0.05
+  token_E: 0.03
+  ...剩下 45 个各零点几
+
+Top-P=0.85 累加：
+  A:         0.40  < 0.85 ✓
+  A+B:       0.65  < 0.85 ✓
+  A+B+C:     0.77  < 0.85 ✓
+  A+B+C+D:   0.82  < 0.85 ✓
+  A+B+C+D+E: 0.85  ≥ 0.85 → 从这里开始标记为超出
+  → mask 右移一位，E 也保留 → 最终剩 5 个
+```
+
+Top-P 的优势在于**自适应**：模型很确定时（token_A 概率 0.90），只保留 1-2 个；模型犹豫时（前 30 个概率差不多），保留很多个。
+
+##### Top-K 和 Top-P 叠加的效果
+
+两者串联执行：Top-K 先设一个硬上限（最多 50 个），Top-P 再在这 50 个里做自适应裁剪。最终候选数 ≤ min(Top-K 的结果, Top-P 的结果)。
+
+| 场景 | Top-K=50 后 | Top-P=0.85 后 | 实际效果 |
+|------|-----------|-------------|---------|
+| 模型很确定 | 50 个 | 2 个 | Top-P 起主导作用 |
+| 模型中等确定 | 50 个 | 15 个 | 两者配合 |
+| 模型很犹豫 | 50 个 | 50 个 | Top-K 起主导作用（兜底） |
+| 没有 Top-K | 6400 个 | 可能上百个 | Top-P 独自工作，候选可能过多 |
+
+MiniMind 默认 `temperature=0.85, top_p=0.85, top_k=50`——温度略低让分布更集中，Top-K 兜底不超过 50，Top-P 自适应裁剪。
+
+##### ⑤ do_sample：采样 vs 贪心
+
+经过前面四步处理后，logits 已经修剪好了，最后一步是从中选出一个 token。`do_sample` 控制怎么选：
+
+```python
+if do_sample:
+    # 随机采样：按概率分布抽签，概率高的中签率高，但不保证选最高的
+    next_token = torch.multinomial(torch.softmax(logits, dim=-1), num_samples=1)
+else:
+    # 贪心：永远选概率最高的那个，100% 确定性，输出完全可复现
+    next_token = torch.argmax(logits, dim=-1, keepdim=True)
+```
+
+| `do_sample` | 行为 | 特点 |
+|-------------|------|------|
+| True（默认） | `multinomial` 按概率随机采 | 同一个 prompt 每次生成不同结果，更有创意 |
+| False | `argmax` 取最大值 | 完全确定性，适合事实性问答、代码生成 |
+
+注意：当 `do_sample=False` 时，前面的 Temperature、Top-K、Top-P 全都白做了——反正最后都是取最大值，修剪候选集没有意义。所以贪心模式下通常把其他参数设为默认值（T=1.0, top_k=0, top_p=1.0），只靠 argmax 决定。
+
+`torch.multinomial` 的工作方式：把 softmax 后的概率当作权重，做一次加权随机抽样。概率 0.4 的 token 有 40% 的几率被选中，0.01 的有 1% 几率。这就是为什么 Temperature、Top-K、Top-P 有意义——它们改变了概率分布的形状，直接影响每个 token 被抽中的几率。
+
+```python
+# @torch.inference_mode(): 比 torch.no_grad() 更彻底的推理模式
+#   no_grad 只是不算梯度，inference_mode 连计算图都不建，
+#   创建的张量标记为"推理专用"，省更多显存、速度更快
 @torch.inference_mode()
 def generate(self, inputs, max_new_tokens=8192, temperature=0.85, top_p=0.85,
              top_k=50, eos_token_id=2, use_cache=True, do_sample=True,
@@ -433,9 +608,10 @@ $$\text{总计} = 7{,}374{,}528 \times 8 + 4{,}915{,}200 + 768 = 63{,}912{,}192 
 | `MiniMindForCausalLM.forward` | `model_minimind.py:245-253` |
 | `generate` | `model_minimind.py:256-288` |
 
-核心逻辑完全一致。两处简化：
-1. 我们的 CausalLM 继承 `nn.Module` 而非 `PreTrainedModel + GenerationMixin`（后者提供 HuggingFace 的 save/load/generate 接口，不影响模型逻辑）
-2. generate 省略了 streamer（流式输出）和 attention_mask 扩展（batch 推理时需要），核心采样逻辑一致
+核心逻辑完全一致。一处简化：
+1. generate 省略了 streamer（流式输出）和 attention_mask 扩展（batch 推理时需要），核心采样逻辑一致
+
+> HuggingFace 的 `PretrainedConfig`、`PreTrainedModel`、`GenerationMixin` 三个基类的作用详见 [09b-PyTorch与HuggingFace基础.md](09b-PyTorch与HuggingFace基础.md)。
 
 ## 业界对比
 
@@ -473,8 +649,12 @@ MiniMind 用 Weight Tying 省了 $6400 \times 768 = 4.9M$ 参数，占总量 ~8%
 > 参数量 **63,912,192 ≈ 63.9M**，与上游完全一致。
 
 ```python
-class MiniMindConfig:
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
+
+class MiniMindConfig(PretrainedConfig):
+    model_type = "minimind"
     def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs):
+        super().__init__(**kwargs)
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = kwargs.get("num_attention_heads", 8)
@@ -539,14 +719,17 @@ class MiniMindModel(nn.Module):
         return hidden_states, presents, aux_loss
 
 
-class MiniMindForCausalLM(nn.Module):
+class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
+    config_class = MiniMindConfig
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     def __init__(self, config: MiniMindConfig = None):
-        super().__init__()
         self.config = config or MiniMindConfig()
+        super().__init__(self.config)
         self.model = MiniMindModel(self.config)
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
         if self.config.tie_word_embeddings:
             self.model.embed_tokens.weight = self.lm_head.weight
+        self.post_init()
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None,
                 use_cache=False, logits_to_keep=0, labels=None):
@@ -560,8 +743,11 @@ class MiniMindForCausalLM(nn.Module):
             x = logits[..., :-1, :].contiguous()
             y = labels[..., 1:].contiguous()
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
-        return {'loss': loss, 'aux_loss': aux_loss, 'logits': logits,
-                'past_key_values': past_key_values}
+        from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+        return MoeCausalLMOutputWithPast(
+            loss=loss, aux_loss=aux_loss, logits=logits,
+            past_key_values=past_key_values, hidden_states=hidden_states,
+        )
 
     @torch.inference_mode()
     def generate(self, inputs, max_new_tokens=8192, temperature=0.85, top_p=0.85,
@@ -574,8 +760,8 @@ class MiniMindForCausalLM(nn.Module):
             past_len = past_key_values[0][0].shape[1] if past_key_values else 0
             outputs = self.forward(input_ids[:, past_len:], use_cache=use_cache,
                                    past_key_values=past_key_values)
-            past_key_values = outputs['past_key_values']
-            logits = outputs['logits'][:, -1, :] / temperature
+            past_key_values = outputs.past_key_values
+            logits = outputs.logits[:, -1, :] / temperature
             if repetition_penalty != 1.0:
                 for i in range(input_ids.shape[0]):
                     seen = torch.unique(input_ids[i])

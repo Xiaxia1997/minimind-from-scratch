@@ -7,13 +7,18 @@ docs-minimind/
 docs-local/
 
 # Claude Code 本地配置
+.claude/
 .agents/
 .vscode/
 skills-lock.json
 CLAUDE.md
 
+# 数据集（太大，不进 git）
+dataset/*.jsonl
+
 # 笔记中的临时文件
-notes/plot_activations.py
-notes/image.png
-notes/image-1.png
+notes/plot_*.py
+notes/image*.png
 notes/swiglu_activations.png
+notes/activation_gradients.png
+notes/*_activations.png

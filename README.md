@@ -4,7 +4,7 @@
 
 # MiniMind From Scratch
 
-### 11,000 行图文笔记 · 逐行手写 · 论文溯源 · 业界对比 · 面试话术
+### 14,600+ 行图文笔记 · 逐行手写 · 论文溯源 · 业界对比 · 面试话术
 
 **别再"跑通就行"了。这次，搞懂每一行。**
 
@@ -27,7 +27,7 @@
 |---|---|---|
 | **目标** | 2 小时跑通训练流程 | 逐行理解每一行代码 |
 | **代码** | 完整可运行的模型 | 每个组件从零手写，逐步拼装 |
-| **讲解深度** | README 概览 | **20+ 篇深度笔记，11,000+ 行图文** |
+| **讲解深度** | README 概览 | **20+ 篇深度笔记，14,600+ 行图文** |
 | **论文溯源** | 未标注来源 | 每个设计追溯到原始论文，区分"实验发现"和"理论推导" |
 | **业界对比** | 单一模型 | 每个组件对比 Qwen、DeepSeek、GLM 的实际参数 |
 | **面试价值** | 无 | 每章末尾 30 秒面试话术，体现"我动手做过" |
@@ -44,7 +44,7 @@
 
 随便点开一章感受一下笔记风格：
 
-> **[04-Attention](notes/04-Attention.md)**（953 行，本仓库最长的一章）
+> **[04-Attention](notes/04-Attention.md)**（953 行）
 >
 > 从最简单的 QKV 点积写起，经过 9 个 Step 逐步演化到完整的 GQA + KV Cache + Flash Attention 分支，每一步都有可运行的代码和维度标注。
 
@@ -85,11 +85,11 @@ RMSNorm → LM Head          → [batch, seq_len, vocab_size] logits
 |------|------|---------|------|
 | [01](notes/01-Embedding.md) | **Embedding** | token → 向量，LM Head 权重共享的数学原理 | 234 |
 | [02](notes/02-RMSNorm.md) | **RMSNorm** | 为什么不用 LayerNorm，Pre-Norm vs Post-Norm | 228 |
-| [03](notes/03-RoPE.md) | **RoPE** | 从二维旋转推导到高维，YaRN 外推扩展 | 720 |
-| [03b](notes/03b-线性代数补充.md) | 数学补充 | 旋转矩阵与 Givens 分解（RoPE 前置知识） | 335 |
+| [03](notes/03-RoPE.md) | **RoPE** | 从二维旋转推导到高维，YaRN 外推扩展 | 803 |
+| [03a](notes/03a-线性代数补充.md) | 数学补充 | 旋转矩阵与 Givens 分解（RoPE 前置知识） | 335 |
 | [04](notes/04-Attention.md) | **Attention** | 9 个 Step 从 QKV 点积演化到 GQA + KV Cache | 953 |
-| [04b](notes/04b-Attention变体演进.md) | Attention 变体 | MHA → MQA → GQA → MLA 演化链 | 458 |
-| [05](notes/05-FeedForward.md) | **FeedForward** | sigmoid → ReLU → SiLU → SwiGLU 演化（配图） | 224 |
+| [04a](notes/04a-Attention变体演进-todo.md) | Attention 变体 | MHA → MQA → GQA → MLA 演化链 + Flash Attention | 843 |
+| [05](notes/05-FeedForward&激活函数.md) | **FeedForward** | sigmoid → ReLU → SiLU → SwiGLU 演化（配图） | 224 |
 | [06](notes/06-MOEFeedForward.md) | **MoE** | TopK 专家路由 + 辅助 loss + 负载均衡 | 785 |
 | [07](notes/07-MiniMindBlock.md) | **MiniMindBlock** | 组装 Attention + FFN + 残差 + Pre-Norm | 192 |
 | [08](notes/08-FullModel.md) | **完整模型** | Config + 所有组件组装，从 token 到 logits | 632 |
@@ -98,24 +98,23 @@ RMSNorm → LM Head          → [batch, seq_len, vocab_size] logits
 
 | 章节 | 主题 | 核心内容 | 行数 |
 |------|------|---------|------|
-| [09](notes/09-训练基础.md) | **训练基础** | 交叉熵 loss、SGD → Adam → AdamW、训练循环 | 775 |
-| [09b](notes/09b-ML数学基础.md) | 数学补充 | 激活函数、损失函数的数学推导 | 806 |
-| [10](notes/10-训练阶段论.md) | **训练阶段** | 预训练 → CPT → SFT → RLHF 全景 | 310 |
-| [11](notes/11-预训练.md) | **预训练** | tokenizer、BPE、数据加载、超参数 | 335 |
-| [12](notes/12-SFT.md) | **SFT** | assistant-only loss mask、LoRA 低秩分解 | 721 |
-| [13](notes/13-DPO.md) | **DPO** | reference model + chosen/rejected log-ratio | 357 |
-| [14](notes/14-GRPO.md) | **GRPO** | Policy Gradient → GRPO、组内 advantage、KL 惩罚 | 878 |
-| [15](notes/15-AgentRL.md) | **Agent RL** | 多轮工具调用的 reward 设计 | 463 |
+| [09](notes/09-训练基础.md) | **训练基础** | 交叉熵 loss、SGD → Adam → AdamW、训练循环 | 730 |
+| [09a](notes/09a-ML数学基础.md) | 数学补充 | 激活函数、损失函数的数学推导 | 2097 |
+| [10](notes/10-训练阶段论.md) | **训练阶段** | 预训练 → CPT → SFT → RLHF 全景 | 369 |
+| [11](notes/11-预训练.md) | **预训练** | tokenizer、BPE、数据加载、超参数 | 404 |
+| [12](notes/12-SFT.md) | **SFT** | assistant-only loss mask、LoRA 低秩分解 | 736 |
+| [13](notes/13-RL对齐基础.md) | **RL 对齐基础** | Policy Gradient → PPO → RLHF 全景 | 918 |
+| [14](notes/14-DPO.md) | **DPO** | reference model + chosen/rejected log-ratio | 463 |
+| [15](notes/15-GRPO.md) | **GRPO** | 组内 advantage、KL 惩罚、DAPO | 513 |
+| [16](notes/16-AgentRL.md) | **Agent RL** | 多轮工具调用的 reward 设计 | 571 |
 
 ### 第三部分：训练工程（面试高频考点）
 
 | 章节 | 主题 | 核心内容 | 行数 |
 |------|------|---------|------|
-| [16](notes/16-分布式训练全景.md) | **分布式训练** | DDP + DeepSpeed + FSDP | 188 |
-| [17](notes/17-FlashAttention.md) | **Flash Attention** | 分块计算，O(S) 内存 | 138 |
+| [17](notes/17-分布式训练全景.md) | **分布式训练** | 通信原语、ZeRO-1/2/3、TP/PP/SP/CP/EP、3D→5D 并行 | 1331 |
 | [18](notes/18-GradientCheckpointing.md) | **梯度检查点** | 时间换空间 | 134 |
-| [19](notes/19-训练工程知识图谱.md) | 知识图谱 | 训练工程全景串联索引 | 57 |
-| [20](notes/20-长上下文技术.md) | **长上下文** | RoPE 外推 + YaRN + 动态 NTK | 608 |
+| [19](notes/19-长上下文技术.md) | **长上下文** | RoPE 外推 + YaRN + 动态 NTK | 625 |
 
 ## 笔记有什么不一样？
 
@@ -160,13 +159,13 @@ RMSNorm → LM Head          → [batch, seq_len, vocab_size] logits
 ```
 minimind-from-scratch/
 ├── notes/                  # 20+ 篇深度笔记（本仓库核心）
-│   ├── 00-学习路线.md       #   数据流全景 + 学习顺序
+│   ├── 00-学习路线.md       #   数据流全景 + 学习顺序 + 面试真题索引
 │   ├── 01~08               #   模型架构篇（Embedding → 完整模型）
-│   ├── 09~15               #   训练全流程（预训练 → Agent RL）
-│   └── 16~20               #   训练工程篇（分布式/FlashAttn/长上下文）
+│   ├── 09~16               #   训练全流程（预训练 → Agent RL）
+│   └── 17~19               #   训练工程篇（分布式/GradientCheckpointing/长上下文）
 ├── scratch/                # 手写复现代码（逐组件拼装）
 │   └── model/
-│       └── model_minimind.py  # 276 行，从零手写的完整模型
+│       └── model_minimind.py  # 454 行，从零手写的完整模型
 ├── model/                  # 原版 MiniMind 模型代码（只读参考）
 ├── trainer/                # 原版训练脚本（只读参考）
 └── images/                 # 图片资源
@@ -175,9 +174,9 @@ minimind-from-scratch/
 ## 更新计划
 
 - [x] 模型架构篇 01-08（已完成）
-- [x] 训练全流程笔记 09-15（已完成）
-- [x] 训练工程篇 16-20（已完成）
-- [ ] 手写复现完整模型组装（scratch/model）
+- [x] 训练全流程笔记 09-16（已完成）
+- [x] 训练工程篇 17-19（已完成）
+- [x] 手写复现完整模型组装（scratch/model）
 - [ ] 在 RTX 4060 上实际训练 + 训练日志
 - [ ] 手写训练脚本（scratch/trainer）
 

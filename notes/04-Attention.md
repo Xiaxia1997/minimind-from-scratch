@@ -21,7 +21,7 @@ Attention 就是让每个 token "看到"其他 token，并决定从谁那里获�
 
 ## 从零开始写
 
-> 以下 Step 1-9 是独立可运行的探索代码（直接粘贴到 Python REPL 即可跑），逐步演化理解 Attention 的设计。最终要追加到 `scratch/model/model_minimind.py` 的正式代码在后面的 [完整实现](#完整实现) 部分。
+> 以下 Step 1-9 逐步演化 Attention 的设计，每步可直接在 Python REPL 运行验证。最终追加到 `scratch/model/model_minimind.py` 的完整 `Attention` 类在后面的 [完整实现](#完整实现) 部分。
 
 ### Step 1：最简 Self-Attention
 
@@ -695,7 +695,7 @@ repeat 之后:  [B, total_seq_len, 8, 96]    ← 8 个头（只用于计算，�
 
 Step 6-8 的手写 Attention 必须把完整的 $[S, S]$ 注意力矩阵存在显存里，且反复在 HBM 上读写它——瓶颈不是算力而是显存带宽。Flash Attention 的解法是分块（tiling）：Q/K/V 切成小块在 SRAM 里算完 softmax + V 加权，配合 online softmax，不存完整 $[S, S]$ 矩阵，速度快 2-4 倍、显存从 O(S²) 降到 O(S)，数学上完全等价。
 
-> 原理深挖（GPU 存储层级、online softmax 递推公式、反向 recomputation、v1/v2/v3 演进）和面试问答见 [17-FlashAttention](17-FlashAttention.md)，本章只关心怎么接入。
+> 原理深挖（GPU 存储层级、online softmax 递推公式、反向 recomputation、v1/v2/v3 演进）和面试问答见 [04a-Attention变体演进 §六](04a-Attention变体演进-todo.md)，本章只关心怎么接入。
 
 #### MiniMind 怎么用？
 

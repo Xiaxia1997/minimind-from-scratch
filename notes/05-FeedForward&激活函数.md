@@ -80,6 +80,25 @@ $$\text{ReLU}(x) = \max(0, x)$$
 ReLU 的问题：x=0 处有硬拐点（梯度不连续），负值全部截断为 0（"死神经元"问题）。
 SiLU 平滑过渡，负值区域不完全丢失信息，梯度处处连续。
 
+### 激活函数及其导数全景
+
+选择激活函数的关键在于**导数的形状**——导数决定了梯度能不能顺利传回去。先看公式，再看图。
+
+| 激活函数 | 公式 $f(x)$ | 导数 $f'(x)$ | 导数特征 | 问题 / 优势 |
+|---------|------------|-------------|---------|------------|
+| **Sigmoid** | $\frac{1}{1+e^{-x}}$ | $\sigma(x)(1-\sigma(x))$ | 最大 0.25，两端趋 0 | 梯度消失严重，多层连乘指数衰减 |
+| **Tanh** | $\frac{e^x - e^{-x}}{e^x + e^{-x}}$ | $1 - \tanh^2(x)$ | 最大 1.0，$\|x\|>2$ 趋 0 | 比 sigmoid 好但仍饱和 |
+| **ReLU** | $\max(0, x)$ | $\begin{cases}1 & x>0 \\ 0 & x \le 0\end{cases}$ | 正区间恒为 1，负区间恒为 0 | 正区间不衰减，但负区间死掉（死神经元） |
+| **SiLU** | $x \cdot \sigma(x)$ | $\sigma(x) + x\sigma(x)(1-\sigma(x))$ | $x \to +\infty$ 趋 1，负值区不为 0 | ReLU 的不衰减 + 负值区不死，**MiniMind 用这个** |
+| **GELU** | $x \cdot \Phi(x)$（$\Phi$ 为高斯 CDF） | 近似 SiLU | 形状接近 SiLU | GPT/BERT 用 |
+| **Softmax** | $\frac{e^{z_i}}{\sum_j e^{z_j}}$ | $p_i(1-p_i)$（对自身的偏导） | $\|z\|$ 大时趋 0（饱和） | Attention score 不除以 $\sqrt{d_k}$ → softmax 饱和 → 梯度消失 |
+
+下图是六种激活函数（实线）和它们的导数（虚线）的可视化，和上表一一对应：
+
+![激活函数及其导数全景](activation_gradients.png)
+
+Softmax 那张图特别重要——它解释了 Chapter 04 Attention 中为什么 score 要除以 $\sqrt{d_k}$：不除的话 score 绝对值很大，softmax 的梯度趋近 0，反向传播时梯度传不回去。三种"归一化"手段的区别详见 [09a-ML数学基础.md](09a-ML数学基础.md) §6.9。
+
 ### Step 3：SwiGLU——加门控机制
 
 #### 从原始 FFN 到 SwiGLU 的变化
