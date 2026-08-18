@@ -52,6 +52,18 @@ attn = torch.softmax(scores, dim=-1)                        # 归一化成概率
 output = attn @ V                                            # [2, 128, 768] 加权聚合
 ```
 
+#### 为什么 Q 和 K 必须用不同的权重矩阵？
+
+直觉上 Q = "我想关注什么"，K = "我能提供什么"，角色不同所以投影不同。但更本质的原因是**注意力必须是非对称的**。
+
+如果让 $W_Q = W_K = W$，注意力分数变成：
+
+$$\text{scores} = (xW)(xW)^T = xWW^Tx^T$$
+
+$WW^T$ 是一个对称矩阵，所以 $\text{scores}_{ij} = \text{scores}_{ji}$——token A 对 token B 的关注分数恒等于 B 对 A 的。这意味着注意力关系只能是**双向对等**的。
+
+但语言中的注意力天然不对称。"踢"需要强烈关注"球"（宾语），但"球"不一定需要同等程度地关注"踢"。用不同的 $W_Q$ 和 $W_K$，scores = $xW_Q(xW_K)^T = xW_QW_K^Tx^T$，$W_QW_K^T$ 不再对称 → 注意力可以是单向的。
+
 **问题**：这是全量注意力，768 维的 Q 关注 768 维的 K——所有维度一起做一个大点积，只能学到一种注意力模式。
 
 ### Step 2：Multi-Head Attention（MHA）——多组并行注意力
@@ -403,6 +415,38 @@ torch.full((4, 4), -inf).triu(1)
 
 对应的还有 `tril`（**tri**angle **l**ower，下三角）和 `torch.diag`（对角线），MiniMind 没用到。
 
+#### 为什么 Decoder-only（因果注意力）优于 Encoder-only（双向注意力）？——满秩论证
+
+这是面试高频题："为什么主流大模型都是 Decoder-only？"。除了"适合生成"这个功能性答案，还有一个数学层面的论点：**因果注意力矩阵是满秩的，双向注意力矩阵容易低秩退化**。
+
+**因果注意力矩阵是下三角的**。softmax 前的 mask 把上三角填成 $-\infty$，softmax 后上三角全是 0：
+
+```
+因果注意力矩阵（softmax 后）:
+  [1.00,    0,     0,     0  ]     ← token 0 只看自己
+  [0.40,  0.60,   0,     0  ]     ← token 1 看 0 和自己
+  [0.15,  0.25,  0.60,   0  ]     ← token 2 看 0/1/自己
+  [0.10,  0.20,  0.30,  0.40]     ← token 3 看所有
+```
+
+下三角矩阵的行列式 = 对角线元素之积。softmax 保证每行至少自己位置有正值（$e^{x_{ii}}$ > 0），所以**对角线全正 → 行列式非零 → 满秩**。满秩意味着每个 token 的注意力分布都是线性无关的——各 token 有独立的信息聚合方式。
+
+**双向注意力矩阵是满矩阵**。每个 token 都能看到所有其他 token：
+
+```
+双向注意力矩阵（softmax 后）:
+  [0.30,  0.25,  0.20,  0.25]
+  [0.25,  0.30,  0.20,  0.25]
+  [0.20,  0.25,  0.30,  0.25]
+  [0.25,  0.20,  0.25,  0.30]
+```
+
+softmax 让每一行都是概率分布（非负、求和为 1）。当所有 token 都能互相看到时，不同行的注意力分布倾向于**趋同**——"每个人都在看大家"导致注意力模式高度相似。行向量趋同 → 矩阵趋向低秩 → 表达能力下降。
+
+直觉上：因果 mask 强制每个 token 看到的"视野"不同（token 0 只看 1 个，token 3 看 4 个），这种**结构性不对称**迫使每一行学出不同的分布。双向注意力没有这个约束，所有行看到相同的全集，容易坍缩成相似的分布。
+
+> 注意：这个论证来自研究社区的分析（如 Dong et al., 2021 "Attention is not all you need: Pure attention loses rank doubly exponentially with depth"），说的是一种**倾向**，不是说双向注意力"一定"低秩。实际上 BERT 加了 Layer Norm 和残差连接后可以缓解低秩退化。但在 decoder-only LLM 的语境下，因果 mask 的满秩特性确实是一个重要优势。
+
 #### `__init__` 无新增
 
 Step 6 不需要在 `__init__` 中新增任何东西。
@@ -578,6 +622,41 @@ Step 7 不需要在 `__init__` 中新增任何东西。
 ### Step 8：注意力计算 + Dropout + 合并头 + 输出投影
 
 到这一步，scores 已经叠加了 causal mask（Step 6）和 padding mask（Step 7）。接下来做四件事：softmax 转概率 → dropout → 加权聚合 V → 合并头 + 输出投影。
+
+#### Safe Softmax：为什么要先减去最大值？
+
+Softmax 的公式是 $\text{softmax}(x_i) = \frac{e^{x_i}}{\sum_j e^{x_j}}$。问题是 $e^x$ 增长极快——$e^{88}$ 就超过了 FP32 的上限（$\approx 3.4 \times 10^{38}$），溢出变成 `inf`；而 $e^{-88}$ 下溢变成 `0`。
+
+实际的 scores 值完全可能达到几十甚至上百（特别是训练中后期 Q/K 幅度变大时），直接算 $e^{x_i}$ 会溢出。
+
+**解法**：利用 softmax 的**平移不变性**——对所有输入减去同一个常数，结果不变：
+
+$$\text{softmax}(x_i) = \frac{e^{x_i}}{\sum_j e^{x_j}} = \frac{e^{x_i - c}}{\sum_j e^{x_j - c}}$$
+
+取 $c = \max_j(x_j)$，减去后最大值变成 0，$e^0 = 1$，其余都是负数 → $e$ 的负数次方一定 $\leq 1$，不会溢出。
+
+用 4 个 token 的例子：
+
+```
+原始 scores:     [90,  100,  85,  95]
+直接 exp:        [exp(90), exp(100), ...]  → exp(100) ≈ 2.7e43 → FP32 溢出！
+
+减去 max(=100):  [-10,   0,  -15,  -5]
+安全 exp:        [4.5e-5, 1.0, 3.1e-7, 6.7e-3]  → 全部 ≤ 1，不溢出 ✓
+归一化:          [0.004,  0.993, 0.000, 0.007]   → 数学上和不减 max 完全等价
+```
+
+PyTorch 的 `F.softmax` 内部已经实现了这个 safe softmax（减 max 再算 exp），我们不需要手动做。但面试中这是高频考点——问的是"你知不知道工程上 softmax 怎么处理数值稳定性"。
+
+**注意区分两个层次**：
+
+| | Safe softmax | $\sqrt{d_k}$ 缩放 |
+|---|---|---|
+| **解决什么** | 防止 $e^x$ 溢出（工程问题） | 防止 softmax 饱和成 one-hot（学习问题） |
+| **怎么做** | 减去 max（不改变结果） | 除以 $\sqrt{d_k}$（改变分布的尖锐程度） |
+| **谁来做** | PyTorch 自动做 | 我们代码里写 |
+
+两者不是替代关系——$\sqrt{d_k}$ 让分布不那么尖锐（避免梯度消失），safe softmax 防止计算过程中数值溢出。一个管"学得好不好"，一个管"算得崩不崩"。
 
 #### `__init__` 中追加
 
@@ -942,6 +1021,47 @@ Step 6: 合并头 + 输出投影
 - **DeepSeek-V2 的 MLA**：把 KV 低秩压缩到 512 维 latent，KV Cache 压缩到极致，比 GQA 更省显存；Q/K 维度拆分为 128 nope + 64 RoPE
 - **Qwen2.5 的 GQA**：Q=28 KV=4，n_rep=7，比我们的 n_rep=2 更激进；无显式 q_norm/k_norm
 - **Flash Attention**：业界用独立的 FlashAttention-2 Triton kernel，MiniMind 用 PyTorch SDPA
+
+## 补充：Cross-Attention（Encoder-Decoder 架构）
+
+MiniMind 是 Decoder-only，不用 Cross-Attention。但面试可能问到原始 Transformer 的 Encoder-Decoder 架构，需要知道 Cross-Attention 怎么工作。
+
+**Self-Attention vs Cross-Attention 的区别只有一点：Q/K/V 的来源不同。**
+
+| | Self-Attention（本章实现的） | Cross-Attention |
+|---|---|---|
+| **Q 来自** | 本层输入 $x$（Decoder 当前状态） | Decoder 当前状态 |
+| **K 来自** | 本层输入 $x$（同一个序列） | **Encoder 最终输出** |
+| **V 来自** | 本层输入 $x$（同一个序列） | **Encoder 最终输出** |
+| **用途** | token 之间互相交互 | Decoder 从 Encoder 的表征中**提取信息** |
+
+原始 Transformer（Vaswani 2017）的 Decoder 每层有**三个**子层：
+
+```
+Decoder 每层:
+  1. Masked Self-Attention    ← Q/K/V 全来自 decoder（本章实现的）
+  2. Cross-Attention          ← Q 来自 decoder，K/V 来自 encoder
+  3. FFN
+```
+
+Cross-Attention 的直觉：在翻译任务中，Encoder 把源语言编码成一组表征。Decoder 在生成目标语言时，需要"回头看"源语言——Q 代表"我现在要生成什么"，K/V 代表"源语言说了什么"，注意力分数决定"我应该关注源语言的哪个部分"。
+
+代码上和 Self-Attention 的唯一区别：
+
+```python
+# Self-Attention: Q/K/V 全来自同一个输入 x
+Q = W_q(x)
+K = W_k(x)
+V = W_v(x)
+
+# Cross-Attention: Q 来自 decoder，K/V 来自 encoder
+Q = W_q(decoder_hidden)        # decoder 当前状态
+K = W_k(encoder_output)        # encoder 最终输出
+V = W_v(encoder_output)        # encoder 最终输出
+# 后面的 scores = QK^T / sqrt(d_k) → softmax → ×V 完全一样
+```
+
+**为什么现代大模型不用 Cross-Attention？** 因为 Decoder-only 架构没有单独的 Encoder。输入（prompt）和输出（生成）都在同一个序列里，用 Self-Attention + Causal Mask 统一处理。不需要两个独立模块之间的跨注意力。
 
 ## 面试话术
 

@@ -21,12 +21,14 @@
 │   ├── 00-学习路线.md       #   数据流全景 + 章节索引 + 面试策略（先读这个）
 │   ├── 01~08               #   模型架构篇（Embedding → RMSNorm → RoPE → Attention → FFN → MoE → Block → 完整模型）
 │   ├── 09~16               #   训练篇（训练基础 → 预训练 → SFT → RL对齐/DPO/GRPO/AgentRL）
-│   ├── 17~19               #   训练工程篇（分布式、Gradient Checkpointing、长上下文）
+│   ├── 17~18               #   训练工程篇（分布式、长上下文）
+│   ├── 19-前沿模型技术全景.md #   前沿技术全景（1900 行）：DeepSeek V4/GLM-5/Kimi/Qwen3/MiniMax/MiMo 完整对比
 │   └── *.png, plot_activations.py  # 笔记配图及绘图脚本
 ├── scratch/                # 手写复现代码（本仓库主线工作区）
 │   └── model/model_minimind.py  # 454 行，按章节注释分块逐步追加，__main__ 块内含自验证
 ├── model/                  # 上游原版模型代码（model_minimind.py / model_lora.py / tokenizer）——只读参考，不要改
 ├── trainer/                # 上游原版训练脚本（train_pretrain/full_sft/lora/dpo/grpo/ppo/agent 等）——只读参考，不要改
+├── docs-local/             # 技术报告研究笔记（*.md）+ 15 篇原始论文 PDF（papers/*.pdf）
 ├── dataset/                # lm_dataset.py（Dataset 定义，只读参考）+ 数据集文件存放处（数据本身不入库）
 ├── scripts/                # 上游推理/部署脚本（web_demo、serve_openai_api、chat_api、convert_model、eval_toolcall）
 ├── eval_llm.py             # 上游交互式对话评估脚本（从仓库根目录运行）
@@ -102,6 +104,9 @@ notes/17-分布式训练全景、18-GradientCheckpointing、19-长上下文技�
 6. **面试话术**：每章笔记末尾写 30 秒面试话术，体现"我动手做过"
 7. **格式**：写 md 文档时数学公式用 LaTeX（`$...$` / `$$...$$`）；直接对话回复时禁止 LaTeX（终端不渲染），用代码块或纯文本；代码块标注语言；架构图用等宽对齐的普通代码块
 8. **语言**：笔记、注释、文档一律用中文（与现有内容保持一致）
+9. **提纲先行，一个概念一个家**：写长笔记（多 Part）前先输出完整目录 + 每节一句话职责，冻结提纲再逐节写；每个概念只在一个小节完整展开，其他地方只允许一句话引用（"见 X.Y"），禁止在两处重复讲解；承上启下的预告同一内容只写一次
+10. **数字必须可溯源**：笔记中的具体数字要么来自可验算的例子（给出算式），要么来自论文/官方资料（标注出处）；解释性的比例、占比、贡献度一律用定性说法（"贡献极小"），禁止编造精确百分比
+11. **结构变更后必须全文校验**：移动/拆分/合并小节后，通读全章修正所有交叉引用编号（"见 X.Y"）、检查概念是否重复展开；长笔记交付前用 teach skill 的 Review 模式过一遍（建议在新会话中做，避免写作上下文偏向）
 
 ## Git 与协作注意
 

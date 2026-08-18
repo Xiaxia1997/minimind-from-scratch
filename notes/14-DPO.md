@@ -67,9 +67,19 @@ $$\pi^*(y \mid x) = \frac{1}{Z(x)} \pi_{\text{ref}}(y \mid x) \cdot \exp\!\left(
 
 其中 $Z(x) = \sum_{y} \pi_{\text{ref}}(y \mid x) \cdot \exp(r(x, y) / \beta)$ 是归一化常数。
 
-推导思路（KKT 条件 + 拉格朗日乘子）从略——核心思想是把受约束优化变成无约束优化，然后对 $\pi$ 求导令为 0，解出闭式表达。
+**推导思路**：把 KL 展开，目标函数对 $\pi$ 逐点求导，令为 0，解出 $\pi^*$。
 
-**直觉**：最优策略 = reference 策略 × reward 的指数缩放。reward 高的回复概率被放大，reward 低的被缩小，$\beta$ 控制放大/缩小的力度。
+把 $D_{\text{KL}}$ 的定义 $\sum_y \pi(y|x) \log \frac{\pi(y|x)}{\pi_{\text{ref}}(y|x)}$ 代入优化目标，整理成对每个 $y$ 独立的项：
+
+$$J(\pi) = \sum_y \pi(y|x) \left[r(x,y) - \beta \log \frac{\pi(y|x)}{\pi_{\text{ref}}(y|x)}\right]$$
+
+对 $\pi(y|x)$ 求导令为 0（加上 $\sum_y \pi = 1$ 的拉格朗日乘子约束），得到：
+
+$$r(x,y) - \beta \log \frac{\pi^*(y|x)}{\pi_{\text{ref}}(y|x)} - \beta - \lambda = 0 \quad \Rightarrow \quad \pi^*(y|x) \propto \pi_{\text{ref}}(y|x) \cdot \exp\!\left(\frac{r(x,y)}{\beta}\right)$$
+
+归一化后就是上面的闭式解，$Z(x)$ 吸收了 $\lambda$ 和 $\beta$ 常数项。
+
+**直觉**：最优策略 = reference 策略 × reward 的指数缩放。reward 高的回复概率被放大，reward 低的被缩小，$\beta$ 控制放大/缩小的力度——$\beta$ 大则缩放温和（紧跟 reference），$\beta$ 小则缩放激进（大幅偏离 reference）。
 
 ### 2.3 反解 reward
 
@@ -107,9 +117,38 @@ $$P(y_w \succ y_l \mid x) = \sigma\!\left(\beta \left[\log \frac{\pi^*(y_w \mid 
 
 ### 2.5 DPO 的 Loss
 
-把上述概率的负对数似然作为 loss（最大化偏好概率 = 最小化负对数似然），并把 $\pi^*$ 换成我们正在训练的 $\pi_\theta$：
+把上述概率的负对数似然作为 loss（最大化偏好概率 = 最小化负对数似然），并把 $\pi^*$ 换成我们正在训练的 $\pi_\theta$。**为什么能换？** $\pi^*$ 是满足闭式解的最优策略——我们训不出精确的 $\pi^*$，但最小化 DPO loss 就是在把 $\pi_\theta$ 往 $\pi^*$ 推。loss = 0 当且仅当 $\pi_\theta = \pi^*$。
 
 $$\boxed{\mathcal{L}_{\text{DPO}}(\theta) = -\mathbb{E}_{(x, y_w, y_l) \sim \mathcal{D}} \left[\log \sigma\!\left(\beta \left[\log \frac{\pi_\theta(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)} - \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)}\right]\right)\right]}$$
+
+**逐个符号拆解**：
+
+| 符号 | 全称 | 含义 |
+|------|------|------|
+| $y_w$ | winner / chosen | 人类标注员选出的**更好**回复（数据集中的 `chosen`） |
+| $y_l$ | loser / rejected | 人类标注员选出的**更差**回复（数据集中的 `rejected`） |
+| $\pi_\theta$ | policy | 正在训练的模型，参数为 $\theta$ |
+| $\pi_{\text{ref}}$ | reference model | 冻结的 SFT 模型，训练全程不更新，作为 KL 约束的锚点 |
+| $\beta$ | KL 惩罚系数 | 控制 policy 偏离 reference 的约束强度（MiniMind 默认 0.15） |
+| $\sigma$ | sigmoid 函数 | $\sigma(z) = 1/(1+e^{-z})$，来自 Bradley-Terry 偏好模型，把 reward 差映射到 $[0,1]$ 概率 |
+
+$y_w / y_l$ 的下标来自 Bradley-Terry 的 "winner vs loser" 记法。给定同一个 prompt $x$，标注员比较两条回复，选出 winner（$y_w$）和 loser（$y_l$）：
+
+```
+prompt x: "什么是机器学习？"
+
+y_w (chosen):   "机器学习是 AI 的一个分支，通过从数据中学习模式来做预测..."
+y_l (rejected): "机器学习就是让电脑自己学。"
+```
+
+$\beta$ 的直觉——它在 $\sigma(\beta \cdot \ldots)$ 中做缩放：
+
+- $\beta$ **大**（如 0.5）：$\beta \times \text{logits}$ 被放大 → sigmoid 容易饱和 → 对 policy 偏离 reference 的惩罚更强 → 训练保守
+- $\beta$ **小**（如 0.05）：$\beta \times \text{logits}$ 被缩小 → sigmoid 在线性区，梯度大 → 偏好学习更激进，但易过拟合
+
+这个 $\beta$ 和 2.1 节 RLHF 目标函数里 KL 惩罚前面的 $\beta$ 是**同一个数学量**——DPO 推导的起点就是 $\max \mathbb{E}[r] - \beta \cdot D_{\text{KL}}$，闭式解反解后 $\beta$ 自然保留在 loss 里。
+
+$\sigma$ 来自 2.4 节代入的 Bradley-Terry 模型：$P(y_w \succ y_l) = \sigma(r_w - r_l)$。DPO 用 $\beta \log(\pi_\theta / \pi_{\text{ref}})$ 替换了 $r$，所以 $\sigma$ 里面的参数变成了两个隐式 reward 的差值。外层取 $-\log$ 就是标准的负对数似然——最大化"正确排序 $y_w > y_l$"的概率。
 
 定义 log-ratio：
 
@@ -135,7 +174,13 @@ $\sigma(-\beta(\Delta_w - \Delta_l))$ 是一个动态权重：
 - 当 policy 已经正确排序（$\Delta_w > \Delta_l$）→ $\sigma$ 接近 0 → 梯度很小 → "已经学好了，不用再推"
 - 当 policy 排序错误（$\Delta_w < \Delta_l$）→ $\sigma$ 接近 1 → 梯度大 → "排错了，大力纠正"
 
-这个动态权重是**对排序错误程度的加权**——排错越狠，纠正梯度越大；已经排对就几乎不再推。注意它**不是隐式 KL 约束**：DPO 的 KL 约束来自 $\Delta$ 里的 $\pi_{\text{ref}}$ 项（隐式 reward 以 reference 为零点，见下文 Part 4 的推导），两者不要混为一谈。
+这个动态权重是**对排序错误程度的加权**——排错越狠，纠正梯度越大；已经排对就几乎不再推。
+
+注意区分两件事：
+- **动态权重 $\sigma(-\cdots)$**：控制梯度大小——"这个样本还需不需要学"，是训练效率机制
+- **隐式 KL 约束**：来自 $\Delta$ 里的 $\pi_{\text{ref}}$ 项——$\Delta = \log \pi_\theta - \log \pi_{\text{ref}}$，reward 以 reference 为零点，policy 偏离 reference 越远，隐式 reward 的绝对值越大，sigmoid 越饱和，更新自然变慢
+
+两者协同但不是同一个东西。面试时说"DPO 的 KL 约束是隐式的，体现在 loss 以 π_ref 为锚点"即可，不要说"动态权重就是 KL"。
 
 ---
 
@@ -792,7 +837,7 @@ if __name__ == "__main__":
 
 > "DPO 是对传统 RLHF 的数学简化。核心洞察是：受 KL 约束的 reward 最大化问题有闭式解，最优 reward 可以写成 beta × log(pi/pi_ref) + 常数。把这个代入 Bradley-Terry 偏好模型后，reward model 完全消失——偏好概率只取决于 policy 和 reference 的 log 概率比。
 >
-> 所以 DPO loss = -log sigmoid(beta × (Delta_chosen - Delta_rejected))，其中 Delta = log(pi/pi_ref)。梯度有一个动态权重 sigma(-...)：policy 已经正确排序时梯度自动减小，排错时大力纠正——这就是隐式的 KL 约束。
+> 所以 DPO loss = -log sigmoid(beta × (Delta_chosen - Delta_rejected))，其中 Delta = log(pi/pi_ref)。KL 约束是隐式的——体现在 Delta 以 pi_ref 为锚点，policy 偏离 reference 越远，隐式 reward 越饱和，更新自然变慢。梯度还有一个动态权重 sigma(-...)，已经排对的样本梯度自动减小，排错的大力纠正。
 >
 > 实现上，chosen 和 rejected 拼成一个 batch 做一次前向，拆开算 log-ratio。学习率极低（MiniMind 用 4e-8），防止破坏 SFT 学到的对话能力。
 >

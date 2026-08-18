@@ -135,22 +135,86 @@ MiniMind 的模板末尾有这样一段逻辑：当 `add_generation_prompt=True`
 
 ### Step 3: 写 SFTDataset——构造 input_ids + loss mask
 
-> 写到: `scratch/dataset/lm_dataset.py`（在 PretrainDataset 之后追加）
+> 追加到: `scratch/dataset/lm_dataset.py`（在 PretrainDataset 之后）
 
-SFTDataset 的核心任务：把多轮对话 JSON → ChatML 文本 → token 序列 + loss mask。
+SFTDataset 的核心任务：把多轮对话 JSON → ChatML 文本 → token 序列 + loss mask。以下 3.1-3.4 逐步构建这个类，每一步直接给出要写的代码。
 
-#### 3.1 边界标记：怎么找到 assistant 回复
+#### 3.1 写 `__init__` + `__len__`——加载数据与边界标记
 
-要区分"哪些 token 是 assistant 说的"，需要两个标记：
+先写类骨架。和 PretrainDataset 相比，SFTDataset 的 `__init__` 多了两样东西：
+
+1. **Features schema**：SFT 的 JSONL 每条有 `conversations` 字段（对话列表），每个对话可能有 `role`、`content`、`reasoning_content`、`tools`、`tool_calls` 等字段。用 `Features` 显式声明类型，防止 `load_dataset` 自动推断出错（比如 `None` 值字段被推断为 int）
+
+2. **边界标记** `bos_id` 和 `eos_id`：用来在 token 序列中找到 assistant 回复的起止位置，后面 `generate_labels` 会用到
+
+先在文件顶部补 import（Chapter 11 没用到 `Features`、`Value`、`json`、`random`）：
 
 ```python
-# 写到: scratch/dataset/lm_dataset.py（SFTDataset.__init__ 中）
-self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
-self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
+# 补到 scratch/dataset/lm_dataset.py 顶部 import 区域
+import json
+import random
+from datasets import load_dataset, Features, Value   # 替换原来的 from datasets import load_dataset
 ```
 
-- `bos_id`：`<|im_start|>assistant\n` 的 token 序列——ChatML 格式中 assistant 回复的起始标记
-- `eos_id`：`<|im_end|>\n` 的 token 序列——回复的结束标记
+然后在 PretrainDataset 之后追加两个辅助函数（SFTDataset 的 `__getitem__` 会用到）：
+
+```python
+# 追加到: scratch/dataset/lm_dataset.py（在 PretrainDataset 类之后）
+
+def pre_processing_chat(conversations, add_system_ratio=0.2):
+    """概率性添加 system prompt，让模型学会有/无 system 都能回答"""
+    # tool use 数据完整保留不做处理
+    if any(conv.get('tools') for conv in conversations):
+        return conversations
+    SYSTEM_PROMPTS = [
+        "你是一个知识丰富的AI，尽力为用户提供准确的信息。",
+        "你是minimind，一个小巧但有用的语言模型。",
+        "You are a helpful AI assistant.",
+        "You are minimind, a lightweight intelligent assistant.",
+    ]
+    if conversations[0].get('role') != 'system':
+        if random.random() < add_system_ratio:
+            return [{'role': 'system', 'content': random.choice(SYSTEM_PROMPTS)}] + conversations
+    return conversations
+
+
+def post_processing_chat(prompt_content, empty_think_ratio=0.2):
+    """以 80% 概率移除空思考标签——避免模型总是输出空 <think></think>"""
+    if '<think>\n\n</think>\n\n' in prompt_content and random.random() > empty_think_ratio:
+        prompt_content = prompt_content.replace('<think>\n\n</think>\n\n', '')
+    return prompt_content
+```
+
+接着写 SFTDataset 的 `__init__` 和 `__len__`：
+
+```python
+# 追加到: scratch/dataset/lm_dataset.py（在辅助函数之后）
+
+class SFTDataset(Dataset):
+    def __init__(self, jsonl_path, tokenizer, max_length=1024):
+        super().__init__()
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        # 显式定义 schema，防止 load_dataset 自动推断类型出错
+        features = Features({
+            'conversations': [{
+                'role': Value('string'),
+                'content': Value('string'),
+                'reasoning_content': Value('string'),
+                'tools': Value('string'),
+                'tool_calls': Value('string')
+            }]
+        })
+        self.samples = load_dataset('json', data_files=jsonl_path, split='train', features=features)
+        # 边界标记：用来在 token 序列中定位 assistant 回复的起止位置
+        # bos_id: "<|im_start|>assistant\n" 的 token 序列——回复的起始标记
+        self.bos_id = tokenizer(f'{tokenizer.bos_token}assistant\n', add_special_tokens=False).input_ids
+        # eos_id: "<|im_end|>\n" 的 token 序列——回复的结束标记
+        self.eos_id = tokenizer(f'{tokenizer.eos_token}\n', add_special_tokens=False).input_ids
+
+    def __len__(self):
+        return len(self.samples)
+```
 
 #### 3.2 create_chat_prompt：对话 → ChatML 字符串
 
@@ -410,6 +474,130 @@ AdamW 优化器状态: 每个参数需要存一阶动量 + 二阶动量
 ```
 
 这就是为什么大模型通常用 LoRA 而不是全参 SFT——7B 全参 SFT 固定开销就要 112 GB，一张 A100 80GB 装不下。LoRA 在一张 24GB RTX 4090 上就能跑。
+
+#### 完整的 train_full_sft.py
+
+以下是基于 Chapter 11 的 `train_pretrain.py` 改写的完整文件，可直接运行：
+
+```python
+# 新建: scratch/trainer/train_full_sft.py
+
+import os, sys, time, argparse
+import torch
+from torch import optim
+from torch.utils.data import DataLoader
+from contextlib import nullcontext
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from dataset.lm_dataset import SFTDataset                   # ← 替换 PretrainDataset
+from transformers import AutoTokenizer
+from trainer_utils import get_lr, Logger
+
+
+def train_epoch(model, loader, optimizer, scaler, autocast_ctx, epoch, args):
+    model.train()
+    iters = len(loader)
+    start_time = time.time()
+
+    for step, (input_ids, labels) in enumerate(loader, start=1):
+        input_ids = input_ids.to(args.device)
+        labels = labels.to(args.device)
+
+        current_lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+
+        with autocast_ctx:
+            res = model(input_ids, labels=labels)
+            loss = res.loss + res.aux_loss
+            loss = loss / args.accumulation_steps
+
+        scaler.scale(loss).backward()
+
+        if step % args.accumulation_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        if step % args.log_interval == 0 or step == iters:
+            real_loss = loss.item() * args.accumulation_steps
+            eta_min = (time.time() - start_time) / step * (iters - step) // 60
+            Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) '
+                   f'loss:{real_loss:.4f} lr:{current_lr:.8f} eta:{eta_min:.1f}min')
+
+        if step % args.save_interval == 0 or step == iters:
+            model.eval()
+            ckp = f'{args.save_dir}/full_sft_{args.hidden_size}.pth'
+            torch.save({k: v.half().cpu() for k, v in model.state_dict().items()}, ckp)
+            model.train()
+
+        del input_ids, labels, res, loss
+
+    if iters % args.accumulation_steps != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--save_dir", default="../../out")
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=16)             # ← 比预训练小
+    parser.add_argument("--learning_rate", type=float, default=1e-5)      # ← 比预训练低 50 倍
+    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument("--accumulation_steps", type=int, default=1)      # ← SFT 数据量小，不需要大 batch
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--log_interval", type=int, default=100)
+    parser.add_argument("--save_interval", type=int, default=1000)
+    parser.add_argument("--hidden_size", type=int, default=768)
+    parser.add_argument("--num_hidden_layers", type=int, default=8)
+    parser.add_argument("--max_seq_len", type=int, default=768)           # ← 比预训练长（对话更长）
+    parser.add_argument("--use_moe", type=int, default=0)
+    parser.add_argument("--data_path", default="../../dataset/sft_t2t_mini.jsonl")
+    parser.add_argument("--from_weight", default="pretrain")              # ← 加载预训练权重
+    args = parser.parse_args()
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    lm_config = MiniMindConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        use_moe=bool(args.use_moe),
+    )
+    model = MiniMindForCausalLM(lm_config).to(args.device)
+    tokenizer = AutoTokenizer.from_pretrained('../../model')
+
+    # ← 新增：加载预训练权重（预训练脚本没有这一步）
+    if args.from_weight != 'none':
+        ckp = f'{args.save_dir}/{args.from_weight}_{args.hidden_size}.pth'
+        state_dict = torch.load(ckp, map_location=args.device)
+        model.load_state_dict(state_dict, strict=False)
+        Logger(f'Loaded weights from {ckp}')
+
+    Logger(f'Params: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M')
+
+    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)  # ← SFTDataset
+    loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                        num_workers=4, pin_memory=True, drop_last=True)
+
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    autocast_ctx = (nullcontext() if "cpu" in args.device
+                    else torch.amp.autocast('cuda', dtype=dtype))
+    scaler = torch.amp.GradScaler(enabled=(args.dtype == 'float16'))
+
+    for epoch in range(args.epochs):
+        train_epoch(model, loader, optimizer, scaler, autocast_ctx, epoch, args)
+```
+
+和 `train_pretrain.py` 相比，只改了 4 处（用 `←` 标注）：导入 `SFTDataset`、调低超参数、加载预训练权重、用 `SFTDataset` 创建数据集。训练循环本身一行没改。
 
 ---
 
@@ -672,6 +860,147 @@ LoRA 学习率比全参 SFT 高 10 倍——这是因为 LoRA 参数量少，梯
 | 权重存储 | 每个任务一份完整权重 | 每个任务只存增量（~1MB vs ~128MB） |
 | 灾难性遗忘 | 需要低学习率控制 | 天然抗遗忘（大部分参数冻结） |
 | 适用场景 | 数据量大 + 资源充足 + 追求最优效果 | 数据量小 + 资源有限 + 多任务适配 |
+
+#### 完整的 train_lora.py
+
+以下是基于 `train_full_sft.py` 改写的完整文件，可直接运行：
+
+```python
+# 新建: scratch/trainer/train_lora.py
+
+import os, sys, time, argparse
+import torch
+from torch import optim
+from torch.utils.data import DataLoader
+from contextlib import nullcontext
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
+from model.model_lora import apply_lora, save_lora                       # ← 新增
+from dataset.lm_dataset import SFTDataset
+from transformers import AutoTokenizer
+from trainer_utils import get_lr, Logger
+
+
+def train_epoch(model, loader, optimizer, scaler, autocast_ctx, epoch, lora_params, args):
+    """和全参 SFT 的唯一区别：梯度裁剪作用于 lora_params 而不是 model.parameters()"""
+    model.train()
+    iters = len(loader)
+    start_time = time.time()
+
+    for step, (input_ids, labels) in enumerate(loader, start=1):
+        input_ids = input_ids.to(args.device)
+        labels = labels.to(args.device)
+
+        current_lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = current_lr
+
+        with autocast_ctx:
+            res = model(input_ids, labels=labels)
+            loss = res.loss + res.aux_loss
+            loss = loss / args.accumulation_steps
+
+        scaler.scale(loss).backward()
+
+        if step % args.accumulation_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)  # ← lora_params
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        if step % args.log_interval == 0 or step == iters:
+            real_loss = loss.item() * args.accumulation_steps
+            eta_min = (time.time() - start_time) / step * (iters - step) // 60
+            Logger(f'Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) '
+                   f'loss:{real_loss:.4f} lr:{current_lr:.8f} eta:{eta_min:.1f}min')
+
+        if step % args.save_interval == 0 or step == iters:
+            model.eval()
+            ckp = f'{args.save_dir}/{args.lora_name}_{args.hidden_size}.pth'
+            save_lora(model, ckp)                                        # ← 只存 LoRA 权重
+            model.train()
+
+        del input_ids, labels, res, loss
+
+    if iters % args.accumulation_steps != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--save_dir", default="../../out")
+    parser.add_argument("--lora_name", default="lora_medical")            # ← LoRA 权重名称
+    parser.add_argument("--epochs", type=int, default=10)                 # ← 更多轮
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)      # ← 比全参 SFT 高 10 倍
+    parser.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument("--accumulation_steps", type=int, default=1)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--log_interval", type=int, default=10)           # ← 更频繁打日志
+    parser.add_argument("--save_interval", type=int, default=1000)
+    parser.add_argument("--hidden_size", type=int, default=768)
+    parser.add_argument("--num_hidden_layers", type=int, default=8)
+    parser.add_argument("--max_seq_len", type=int, default=340)
+    parser.add_argument("--use_moe", type=int, default=0)
+    parser.add_argument("--data_path", default="../../dataset/lora_medical.jsonl")
+    parser.add_argument("--from_weight", default="full_sft")              # ← 从 SFT 权重开始
+    args = parser.parse_args()
+    os.makedirs(args.save_dir, exist_ok=True)
+
+    lm_config = MiniMindConfig(
+        hidden_size=args.hidden_size,
+        num_hidden_layers=args.num_hidden_layers,
+        use_moe=bool(args.use_moe),
+    )
+    model = MiniMindForCausalLM(lm_config).to(args.device)
+    tokenizer = AutoTokenizer.from_pretrained('../../model')
+
+    # 加载 SFT 权重
+    ckp = f'{args.save_dir}/{args.from_weight}_{args.hidden_size}.pth'
+    state_dict = torch.load(ckp, map_location=args.device)
+    model.load_state_dict(state_dict, strict=False)
+    Logger(f'Loaded weights from {ckp}')
+
+    # ← 新增：注入 LoRA
+    apply_lora(model)
+
+    # ← 新增：冻结非 LoRA 参数，收集 LoRA 参数
+    lora_params = []
+    for name, param in model.named_parameters():
+        if 'lora' in name:
+            param.requires_grad = True
+            lora_params.append(param)
+        else:
+            param.requires_grad = False
+
+    total_params = sum(p.numel() for p in model.parameters())
+    lora_count = sum(p.numel() for p in lora_params)
+    Logger(f'Total: {total_params/1e6:.2f}M, LoRA: {lora_count/1e6:.2f}M ({lora_count/total_params*100:.1f}%)')
+
+    train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
+    loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                        num_workers=4, pin_memory=True, drop_last=True)
+
+    # ← 优化器只接收 LoRA 参数
+    optimizer = optim.AdamW(lora_params, lr=args.learning_rate)
+
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    autocast_ctx = (nullcontext() if "cpu" in args.device
+                    else torch.amp.autocast('cuda', dtype=dtype))
+    scaler = torch.amp.GradScaler(enabled=(args.dtype == 'float16'))
+
+    for epoch in range(args.epochs):
+        train_epoch(model, loader, optimizer, scaler, autocast_ctx, epoch, lora_params, args)
+```
+
+和 `train_full_sft.py` 相比的区别（用 `←` 标注）：导入 `apply_lora`/`save_lora`、注入 LoRA 并冻结非 LoRA 参数、优化器只接收 `lora_params`、梯度裁剪作用于 `lora_params`、保存时只存 LoRA 权重。
 
 ---
 
@@ -1140,84 +1469,13 @@ print("apply_lora verified!")
 
 > 新建: `scratch/trainer/train_full_sft.py`
 
-训练循环与 Chapter 11 的 `train_pretrain.py` 完全一样，仅修改导入和默认超参数：
-
-```python
-# 和 train_pretrain.py 的核心区别:
-# 1. 导入
-from dataset.lm_dataset import SFTDataset    # 替换 PretrainDataset
-
-# 2. 默认超参数
-parser.add_argument("--save_weight", default='full_sft', type=str)
-parser.add_argument("--learning_rate", default=1e-5, type=float)
-parser.add_argument("--batch_size", default=16, type=int)
-parser.add_argument("--max_seq_len", default=768, type=int)
-parser.add_argument("--from_weight", default='pretrain', type=str)
-parser.add_argument("--data_path", default='../dataset/sft_t2t_mini.jsonl', type=str)
-
-# 3. 数据集创建
-train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
-```
-
-其余所有代码（train_epoch 函数、混合精度、分布式、检查点保存等）与 `train_pretrain.py` 完全一致。
+完整代码见 Step 4 中"完整的 train_full_sft.py"部分，可直接复制。
 
 ### 文件 4: train_lora.py
 
 > 新建: `scratch/trainer/train_lora.py`
 
-在全参 SFT 基础上，修改以下部分：
-
-```python
-# 和 train_full_sft.py 的核心区别:
-
-# 1. 额外导入
-from model.model_lora import save_lora, apply_lora
-
-# 2. 默认超参数
-parser.add_argument("--lora_name", default='lora_medical', type=str)
-parser.add_argument("--learning_rate", default=1e-4, type=float)      # 高 10 倍
-parser.add_argument("--batch_size", default=32, type=int)
-parser.add_argument("--epochs", default=10, type=int)                  # 更多轮
-parser.add_argument("--max_seq_len", default=340, type=int)
-parser.add_argument("--from_weight", default='full_sft', type=str)     # 从 SFT 权重开始
-
-# 3. 模型初始化: 注入 LoRA + 冻结
-model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-apply_lora(model)
-
-lora_params = []
-for name, param in model.named_parameters():
-    if 'lora' in name:
-        param.requires_grad = True
-        lora_params.append(param)
-    else:
-        param.requires_grad = False
-
-# 4. 优化器只接收 LoRA 参数
-optimizer = optim.AdamW(lora_params, lr=args.learning_rate)
-
-# 5. train_epoch 中梯度裁剪作用于 lora_params
-torch.nn.utils.clip_grad_norm_(lora_params, args.grad_clip)
-
-# 6. 保存时只存 LoRA 权重
-save_lora(model, lora_save_path)
-
-# 7. torch.compile 自动关闭
-if args.use_compile == 1:
-    args.use_compile = 0
-    Logger('[LoRA] monkey-patch forward 与 torch.compile 不兼容，use_compile 已自动关闭')
-```
-
-训练流程对比：
-
-```
-全参 SFT:
-  加载预训练权重 → 所有参数可训练 → AdamW(model.parameters()) → 保存全部权重
-
-LoRA SFT:
-  加载 SFT 权重 → apply_lora() 注入 LoRA → 冻结非 LoRA 参数
-  → AdamW(lora_params) → 只保存 LoRA 权重 → 可选: merge_lora 融合
-```
+完整代码见 Step 7 中"完整的 train_lora.py"部分，可直接复制。
 
 ---
 

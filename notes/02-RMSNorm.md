@@ -55,6 +55,26 @@ hidden_states = hidden_states + self.mlp(
 | 理论表达能力 | 某些研究观察到略强 | 某些研究观察到略弱 |
 | 工程结论 | **稳定性的收益远大于理论表达力的微小差距** | **绝大多数主流 LLM 的选择** |
 
+### Pre-Norm 的代价：等效深度变浅
+
+上面表格里"某些研究观察到略弱"不是玄学，背后有明确的数学机制。
+
+Pre-Norm 的残差连接形式：
+
+$$x_{l+1} = x_l + F(\text{Norm}(x_l))$$
+
+随着层数加深，$x_l$ 是前面所有层贡献的累加：$x_l = x_0 + \sum_{i=0}^{l-1} F(\text{Norm}(x_i))$。每一层新增的 $F(\text{Norm}(x_l))$ 相对于这个累积和越来越小——$x_l$ 这条"直通通道"越来越主导最终输出。深层的 $F$ 对最终输出的**边际贡献被稀释**，模型的行为更像一个浅层网络。这就是 Pre-Norm "等效深度变浅"的核心机制（[On the Connections between Residual Learning and the Lottery Ticket Hypothesis, He et al., 2020] 从另一个角度观察到了类似现象；[DeepNet, Wang et al., 2022] 对此做了系统分析）。
+
+Post-Norm 的形式：
+
+$$x_{l+1} = \text{Norm}(x_l + F(x_l))$$
+
+Norm 作用在残差相加**之后**，每一层的贡献都会被重新归一化，不会出现"直通通道主导"的问题——每一层的 $F$ 对输出的贡献不会随深度递减。因此 Post-Norm 的**有效深度更大**，理论表达力更强。
+
+但 Post-Norm 的代价也很明确：Norm 卡在残差通路上，梯度回传时必须穿过每一层的 Norm，深层网络容易梯度不稳定。训练时需要精心的 warmup 调度和初始化策略（如 [DeepNet, Wang et al., 2022] 提出的 DeepNorm 初始化），否则训练直接发散。
+
+**实践结论**：Pre-Norm 训练稳定但收敛性能略低（等效深度浅），Post-Norm 潜在性能更高但训练更难。当前主流 LLM 选择 Pre-Norm，是用一点理论性能换取工程上的稳定性和可扩展性。
+
 ### 面试话术（Pre-Norm vs Post-Norm）
 
 > "MiniMind 用的是 Pre-Norm，把 RMSNorm 放在 Attention 和 FFN 之前，残差连接形成一条干净的梯度高速公路——梯度回传不需要穿过 Norm 层，所以深层模型训练更稳定。对比原始 Transformer 的 Post-Norm，Pre-Norm 不需要精心的 warmup，工程上更友好。LLaMA 之后这就是业界标配了，Qwen、DeepSeek 全用 Pre-Norm。"
